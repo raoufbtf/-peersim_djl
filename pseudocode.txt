@@ -1,0 +1,162 @@
+# Pseudocode des classes du projet PeerSim Chord DHT
+
+## Classe App
+Classe principale qui lance la simulation PeerSim.
+
+Fonction main(args):
+    Afficher "Démarrage de la simulation PeerSim..."
+    Créer une instance de Simulator avec la configuration "peersim.cfg"
+    Lancer la simulation
+    Afficher "Simulation terminée."
+
+## Classe ChordProtocol
+Implémente le protocole Chord avec tolérance aux pannes.
+
+Attributs:
+- DEBUG: booléen pour activer les logs
+- selfNode: nœud actuel
+- successor: successeur
+- predecessor: prédécesseur
+- finger: table des fingers
+- successorList: liste des successeurs (taille 3)
+- m: nombre de bits pour l'espace d'identifiant
+- nodeId: ID du nœud
+
+Méthode initialize():
+    Initialiser m = log2(taille réseau)
+    Initialiser finger table de taille m
+    Initialiser successorList de taille 3
+    Créer selfNode
+    nodeId = selfNode.getIndex()
+
+Méthode nextCycle():
+    Nettoyer les références mortes (successor, predecessor, fingers, successorList)
+    Mettre à jour successorList
+    Appeler stabilize()
+    Appeler fixFingers()
+
+Méthode cleanupDeadReferences():
+    Si successor mort: nettoyer et log si DEBUG
+    Si predecessor mort: nettoyer et log si DEBUG
+    Pour chaque finger mort: nettoyer et log si DEBUG
+    Pour chaque successorList mort: nettoyer et log si DEBUG
+
+Méthode stabilize():
+    Si successor mort:
+        Chercher premier backup vivant dans successorList
+        Basculer dessus et log si DEBUG
+        Si aucun vivant:
+            successor = selfNode
+            predecessor = selfNode  # Fermer l'anneau sur soi-même si seul nœud restant
+            return
+    Mettre à jour successorList
+    x = successor.predecessor
+    Si x est entre nodeId et successor.nodeId:
+        successor = x
+    Notifier successor de mettre à jour son predecessor
+
+Méthode fixFingers():
+    nextFinger = (nextFinger + 1) % m
+    start = nodeId + 2^nextFinger
+    succ = findSuccessor(start)
+    Si finger[nextFinger] mort: recalculer et log si DEBUG
+    finger[nextFinger] = succ vivant ou successor ou selfNode
+
+Méthode findSuccessor(id):
+    Si id entre nodeId et successor: retourner successor
+    Sinon: retourner closestPrecedingNode(id).findSuccessor(id)
+
+Méthode closestPrecedingNode(id):
+    Pour i de m-1 à 0:
+        Si finger[i] vivant et entre nodeId et id: retourner finger[i]
+    Retourner successor vivant ou selfNode
+
+Méthode updateSuccessorList():
+    current = successor
+    Pour i de 0 à SUCCESSOR_LIST_SIZE-1:
+        Si current mort: break
+        successorList[i] = current
+        current = current.successor
+
+Méthode isAlive(node):
+    Si node null: false
+    Si pas dans réseau: false
+    Si pas de protocole Chord: false
+    Sinon: true
+
+Méthodes statiques printNetworkState(), printFingerTables(): Afficher état si DEBUG
+
+## Classe DynamicControl
+Gère les événements dynamiques: ajouts, suppressions, crashes.
+
+Attributs:
+- DEBUG: booléen pour logs
+- pid: ID du protocole
+- cycleCount: compteur de cycles
+- addCount: compteur d'ajouts
+
+Méthode execute():
+    cycleCount++
+    Si cycleCount % 5 == 0 et réseau > 3: simuler crash
+    Si cycleCount % 2 == 0: ajouter nœud
+    Si cycleCount % 4 == 0: supprimer nœud
+    Effectuer lookup test
+    Si cycleCount % 3 == 0 et DEBUG: afficher état réseau
+    Stabiliser tous les nœuds
+
+Méthode simulateCrash():
+    Choisir nœud aléatoire vivant
+    Le supprimer du réseau
+    Log "Simulated crash: Node X removed"
+    Stabiliser tous les nœuds
+
+Méthode addNewNode():
+    newId = 7 + addCount
+    Créer nouveau nœud avec ID newId
+    existingNode = nœud aléatoire
+    Joindre via existingNode
+    Rebuild finger table du nouveau
+    Stabiliser tous
+    Log ajout et afficher état si DEBUG
+
+Méthode removeNode():
+    Choisir nœud aléatoire
+    Mettre à jour prédécesseur et successeur
+    Supprimer du réseau
+    Stabiliser tous
+    Log suppression et afficher état si DEBUG
+
+Méthode performLookupTest():
+    startNode = nœud aléatoire
+    testId = aléatoire 0-19
+    found = startNode.findSuccessor(testId)
+    Log lookup si DEBUG
+
+Méthode stabilizeAllNodes():
+    Pour chaque nœud: appeler stabilize()
+
+## Classe InitControl
+Initialise le réseau et effectue les tests initiaux.
+
+Attributs:
+- pid: ID du protocole
+
+Méthode execute():
+    Créer anneau initial avec 8 nœuds (0-7)
+    Pour chaque nœud: initialiser successor, predecessor, finger table
+    Afficher état initial
+    Effectuer lookups de test
+    Afficher finger tables
+
+Méthode createInitialRing():
+    Pour i de 0 à 7:
+        Créer nœud i
+        successor = nœud (i+1)%8
+        predecessor = nœud (i-1+8)%8
+        Initialiser finger table avec successors proches
+
+Méthode performInitialLookups():
+    Pour testId de 0 à 15:
+        found = findSuccessor(testId)
+        Log lookup</content>
+<parameter name="filePath">C:\Users\Admin\projects\peersim-djl 2\pseudocode.txt
