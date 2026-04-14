@@ -32,6 +32,8 @@ public class LearningControl implements Control {
      */
     private static final class LearningRunState {
         private final int runIndex;
+        private final SessionRequest request;
+        private ActiveSession activeSession = null;
         private LearningSession currentSession = null;
         private boolean electionDone = false;
         private boolean sessionInitialized = false;
@@ -45,8 +47,9 @@ public class LearningControl implements Control {
         private final java.util.Random batchRandom = new java.util.Random();
         private int roundRobinCursor = 0;
 
-        private LearningRunState(int runIndex) {
+        private LearningRunState(int runIndex, int requestedLearners, String datasetPath) {
             this.runIndex = runIndex;
+            this.request = new SessionRequest(runIndex + 1, requestedLearners, datasetPath);
         }
     }
 
@@ -91,6 +94,8 @@ public class LearningControl implements Control {
     private int roundRobinCursor = 0;
     private final java.util.List<LearningRunState> learningRuns = new java.util.ArrayList<>();
     private boolean learningRunsInitialized = false;
+    private final SessionQueueManager sessionQueueManager = SessionQueueManager.getInstance();
+    private final java.util.List<Integer> sessionNodeRequirements;
 
     /**
      * Construit le contrôleur d'apprentissage depuis la configuration PeerSim.
@@ -105,6 +110,7 @@ public class LearningControl implements Control {
         this.maxBatchesPerNode = Math.max(1,
                 Configuration.getInt(prefix + ".maxBatchesPerNode", DEFAULT_MAX_BATCHES_PER_NODE));
         this.learningSessionCount = Math.max(1, Configuration.getInt(prefix + ".sessionCount", 1));
+        this.sessionNodeRequirements = parseNodeRequirements(Configuration.getString(prefix + ".sessionRequirements", ""));
         String strategyName = Configuration.getString(prefix + ".batchStrategy", "ROUND_ROBIN");
         BatchAssignmentStrategy parsedStrategy;
         try {
@@ -131,9 +137,17 @@ public class LearningControl implements Control {
                 continue;
             }
 
-            if (!run.electionDone) {
-                performElection(run);
-                run.electionDone = (run.currentSession != null);
+            if (run.activeSession == null) {
+                run.activeSession = sessionQueueManager.tryStartSession(run.request);
+                if (run.activeSession == null) {
+                    System.out.println("[LearningControl] ⏳ Session " + run.request.sessionId
+                            + " en attente: besoin=" + run.request.requiredLearners
+                            + ", nœuds libres=" + countFreeNodesForRun(run));
+                    continue;
+                }
+
+                run.currentSession = run.activeSession.getLearningSession();
+                run.electionDone = true;
                 continue;
             }
 
@@ -165,16 +179,55 @@ public class LearningControl implements Control {
      */
     private void initializeLearningRuns() {
         learningRuns.clear();
-        for (int i = 0; i < learningSessionCount; i++) {
-            learningRuns.add(new LearningRunState(i));
+        java.util.List<Integer> requirements = new java.util.ArrayList<>(sessionNodeRequirements);
+        if (requirements.isEmpty()) {
+            for (int i = 0; i < learningSessionCount; i++) {
+                requirements.add(activeNodeCount);
+            }
+        }
+
+        for (int i = 0; i < requirements.size(); i++) {
+            learningRuns.add(new LearningRunState(i, requirements.get(i), datasetPath));
         }
         learningRunsInitialized = true;
         System.out.println("[LearningControl] ✓ Initialisation de " + learningRuns.size() + " apprentissages simultanés");
     }
 
     /**
+     * Parse une liste de besoins en nœuds séparés par des virgules.
+     */
+    private java.util.List<Integer> parseNodeRequirements(String rawValue) {
+        java.util.List<Integer> counts = new java.util.ArrayList<>();
+        if (rawValue == null || rawValue.trim().isEmpty()) {
+            return counts;
+        }
+
+        String[] parts = rawValue.split(",");
+        for (String part : parts) {
+            try {
+                int parsed = Integer.parseInt(part.trim());
+                if (parsed > 0) {
+                    counts.add(parsed);
+                }
+            } catch (Exception ignored) {
+                // Valeur ignorée si elle n'est pas numérique.
+            }
+        }
+
+        return counts;
+    }
+
+    /**
+     * Compte les nœuds encore disponibles pour un apprentissage.
+     */
+    private int countFreeNodesForRun(LearningRunState run) {
+        return NodeStateManager.getInstance().getAvailableLearners().size();
+    }
+
+    /**
      * Effectue l'élection du nœud IDE (celui avec le ChordId maximal).
      */
+    @SuppressWarnings("unused")
     private void performElection(LearningRunState run) {
         System.out.println("[LearningControl] === CYCLE " + peersim.core.CommonState.getTime() + " : Début de l'élection ===");
 
@@ -231,33 +284,10 @@ public class LearningControl implements Control {
             return;
         }
 
-        System.out.println("[LearningControl] === CYCLE " + peersim.core.CommonState.getTime() + " : Vérification de l'élection ===");
+        System.out.println("[LearningControl] === Session " + run.currentSession.sessionId + " : initialisation ===");
+        System.out.println("[LearningControl] ✓ IDE Node réservé : " + run.currentSession.ideNodeIdString);
 
-        // Vérifier que l'IDE est toujours en vie
-        boolean ideIsAlive = false;
-
-        for (int i = 0; i < Network.size(); i++) {
-            Node node = Network.get(i);
-            ChordProtocol protocol = (ChordProtocol) node.getProtocol(pid);
-            if (protocol != null && protocol.nodeId == run.currentSession.ideNodeId) {
-                if (node.isUp()) {
-                    ideIsAlive = true;
-                }
-                break;
-            }
-        }
-
-        if (!ideIsAlive) {
-            System.err.println("[LearningControl] ⚠ ERREUR : IDE Node " + run.currentSession.ideNodeIdString + " est MORT !");
-            run.electionDone = false;
-            run.currentSession = null;
-            performElection(run);
-            return;
-        }
-
-        System.out.println("[LearningControl] ✓ IDE Node toujours actif : " + run.currentSession.ideNodeIdString);
-
-        // Sélectionner les nœuds actifs ciblés (IDE + autres nœuds libres)
+        // Sélectionner les nœuds actifs de cette session uniquement
         run.activeParticipants = selectActiveParticipants(run);
 
         // Initialiser la liste des nœuds actifs dans la session
@@ -296,29 +326,18 @@ public class LearningControl implements Control {
      * Sélectionne exactement `activeNodeCount` nœuds actifs, en incluant d'abord l'IDE.
      */
     private java.util.List<ChordProtocol> selectActiveParticipants(LearningRunState run) {
-        java.util.List<ChordProtocol> allActive = new java.util.ArrayList<>();
-
-        for (int i = 0; i < Network.size(); i++) {
-            Node node = Network.get(i);
-            if (!node.isUp()) continue;
-
-            ChordProtocol protocol = (ChordProtocol) node.getProtocol(pid);
-            if (protocol != null) {
-                allActive.add(protocol);
-            }
-        }
-
-        ChordProtocol ideProtocol = findProtocolByChordId(run.currentSession.ideNodeId);
         java.util.List<ChordProtocol> selected = new java.util.ArrayList<>();
 
+        ChordProtocol ideProtocol = findProtocolByChordId(run.currentSession.ideNodeId);
         if (ideProtocol != null) {
             selected.add(ideProtocol);
         }
 
-        for (ChordProtocol protocol : allActive) {
-            if (selected.size() >= activeNodeCount) break;
-            if (ideProtocol != null && protocol.nodeId == ideProtocol.nodeId) continue;
-            selected.add(protocol);
+        for (int learnerChordId : run.activeSession.getLearnerChordIds()) {
+            ChordProtocol learnerProtocol = findProtocolByChordId(learnerChordId);
+            if (learnerProtocol != null) {
+                selected.add(learnerProtocol);
+            }
         }
 
         return selected;
@@ -398,12 +417,15 @@ public class LearningControl implements Control {
                 ? Math.max(1, activeNodeCount)
                 : Math.max(1, run.activeParticipants.size());
         int targetBatchCount = Math.max(1, effectiveNodeCount);
-        int computedBatchSize = Math.max(1, (int) Math.ceil((double) run.receivedDataset.length / targetBatchCount));
+        int effectiveBatchCount = Math.min(targetBatchCount, run.receivedDataset.length);
+        int baseBatchSize = run.receivedDataset.length / effectiveBatchCount;
+        int remainder = run.receivedDataset.length % effectiveBatchCount;
 
-        int batchIndex = 0;
-        for (int start = 0; start < run.receivedDataset.length; start += computedBatchSize) {
-            int end = Math.min(start + computedBatchSize, run.receivedDataset.length);
-            double[][] batchData = new double[end - start][];
+        int start = 0;
+        for (int batchIndex = 0; batchIndex < effectiveBatchCount; batchIndex++) {
+            int batchSize = baseBatchSize + (batchIndex < remainder ? 1 : 0);
+            int end = start + batchSize;
+            double[][] batchData = new double[batchSize][];
 
             for (int i = start; i < end; i++) {
                 batchData[i - start] = java.util.Arrays.copyOf(run.receivedDataset[i], run.receivedDataset[i].length);
@@ -411,11 +433,11 @@ public class LearningControl implements Control {
 
             DataBatch batch = new DataBatch(run.currentSession.sessionId + "_batch_" + batchIndex, batchData);
             batches.add(batch);
-            batchIndex++;
+            start = end;
         }
 
         System.out.println("[LearningControl] ✓ Split dynamique: " + run.receivedDataset.length
-                + " lignes, " + effectiveNodeCount + " nodes, batchSize=" + computedBatchSize
+                + " lignes, " + effectiveNodeCount + " nodes, targetBatchCount=" + targetBatchCount
                 + ", batchCount=" + batches.size());
 
         return batches;
@@ -432,12 +454,16 @@ public class LearningControl implements Control {
         }
 
         java.util.List<ChordProtocol> availableProtocols = new java.util.ArrayList<>();
-        for (int i = 0; i < Network.size(); i++) {
-            Node node = Network.get(i);
-            if (!node.isUp()) continue;
 
-            ChordProtocol protocol = (ChordProtocol) node.getProtocol(pid);
-            if (protocol != null) {
+        // L'IDE participe aussi au traitement (rôle IDE + learner).
+        ChordProtocol ideProtocol = findProtocolByChordId(run.currentSession.ideNodeId);
+        if (ideProtocol != null) {
+            availableProtocols.add(ideProtocol);
+        }
+
+        for (int learnerChordId : run.activeSession.getLearnerChordIds()) {
+            ChordProtocol protocol = findProtocolByChordId(learnerChordId);
+            if (protocol != null && !availableProtocols.contains(protocol)) {
                 availableProtocols.add(protocol);
             }
         }
@@ -608,6 +634,7 @@ public class LearningControl implements Control {
             }
 
             System.out.println("[LearningControl] ✓ Nettoyage batchs physiques terminé : " + deletedCount + "/" + run.distributedBatches.size());
+            sessionQueueManager.onSessionComplete(run.request.sessionId);
             System.out.println("[LearningControl] === Apprentissage distribué TERMINÉ ===");
             run.completionDone = true;
         } else {

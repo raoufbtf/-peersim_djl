@@ -42,7 +42,7 @@ public class App {
             System.out.println("Démarrage de la simulation PeerSim...");
             System.out.println("  Dataset: " + request.datasetPath);
             System.out.println("  Nœuds   : " + request.nodeCount);
-            System.out.println("  Sessions: " + request.sessionCount);
+            System.out.println("  Demandes: " + request.sessionNodeRequirements);
 
             Simulator.main(new String[]{configPath.toString()});
             System.out.println("Simulation terminée.");
@@ -74,23 +74,23 @@ public class App {
     private static SimulationRequest readSimulationRequest(String[] args) {
         String datasetPath;
         int nodeCount;
-        int sessionCount;
+        String sessionRequirements;
 
         if (args != null && args.length >= 3) {
             datasetPath = args[0].trim();
             nodeCount = parsePositiveInt(args[1], 4);
-            sessionCount = parsePositiveInt(args[2], 1);
+            sessionRequirements = args[2].trim();
         } else {
             System.out.println("=== Mode démo PeerSim ===");
             try (Scanner scanner = new Scanner(System.in)) {
                 System.out.print("Chemin du dataset CSV: ");
                 datasetPath = scanner.nextLine().trim();
 
-                System.out.print("Nombre de nœuds à utiliser: ");
+                System.out.print("Nombre total de nœuds du réseau: ");
                 nodeCount = parsePositiveInt(scanner.nextLine(), 4);
 
-                System.out.print("Nombre d'apprentissages à lancer (1 ou 2): ");
-                sessionCount = parsePositiveInt(scanner.nextLine(), 1);
+                System.out.print("Nœuds requis par apprentissage (ex: 2,6): ");
+                sessionRequirements = scanner.nextLine().trim();
             }
         }
 
@@ -98,7 +98,12 @@ public class App {
             datasetPath = "src/main/resources/sample_dataset.csv";
         }
 
-        return new SimulationRequest(datasetPath, Math.max(1, nodeCount), Math.max(1, Math.min(sessionCount, 2)));
+        java.util.List<Integer> parsedRequirements = parseNodeRequirements(sessionRequirements);
+        if (parsedRequirements.isEmpty()) {
+            parsedRequirements = java.util.Arrays.asList(2, 2);
+        }
+
+        return new SimulationRequest(datasetPath, Math.max(1, nodeCount), parsedRequirements);
     }
 
     /**
@@ -113,12 +118,11 @@ public class App {
 
         Map<String, String> overrides = new LinkedHashMap<>();
         overrides.put("network.size", String.valueOf(request.nodeCount));
-        overrides.put("simulation.cycles", "24");
+        overrides.put("simulation.cycles", String.valueOf(Math.max(24, request.sessionNodeRequirements.size() * 12)));
         overrides.put("control.learning.datasetPath", request.datasetPath.replace('\\', '/'));
-        overrides.put("control.learning.activeNodeCount", String.valueOf(request.nodeCount));
         overrides.put("control.learning.batchStrategy", "ROUND_ROBIN");
         overrides.put("control.learning.maxBatchesPerNode", "2");
-        overrides.put("control.learning.sessionCount", String.valueOf(request.sessionCount));
+        overrides.put("control.learning.sessionRequirements", joinRequirements(request.sessionNodeRequirements));
         overrides.put("control.learning.pid", "0");
 
         builder.append(System.lineSeparator())
@@ -145,17 +149,50 @@ public class App {
     }
 
     /**
+     * Parse une liste de besoins en nœuds séparés par des virgules.
+     */
+    private static java.util.List<Integer> parseNodeRequirements(String rawValue) {
+        java.util.List<Integer> counts = new java.util.ArrayList<>();
+        if (rawValue == null || rawValue.trim().isEmpty()) {
+            return counts;
+        }
+
+        String[] parts = rawValue.split(",");
+        for (String part : parts) {
+            int parsed = parsePositiveInt(part, -1);
+            if (parsed > 0) {
+                counts.add(parsed);
+            }
+        }
+        return counts;
+    }
+
+    /**
+     * Transforme les besoins en chaîne exploitable dans la configuration PeerSim.
+     */
+    private static String joinRequirements(java.util.List<Integer> requirements) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < requirements.size(); i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(requirements.get(i));
+        }
+        return builder.toString();
+    }
+
+    /**
      * Demande utilisateur contenant les paramètres de la simulation.
      */
     private static final class SimulationRequest {
         private final String datasetPath;
         private final int nodeCount;
-        private final int sessionCount;
+        private final java.util.List<Integer> sessionNodeRequirements;
 
-        private SimulationRequest(String datasetPath, int nodeCount, int sessionCount) {
+        private SimulationRequest(String datasetPath, int nodeCount, java.util.List<Integer> sessionNodeRequirements) {
             this.datasetPath = datasetPath;
             this.nodeCount = nodeCount;
-            this.sessionCount = sessionCount;
+            this.sessionNodeRequirements = sessionNodeRequirements;
         }
     }
 }

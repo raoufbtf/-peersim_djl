@@ -29,6 +29,10 @@ public class InitControl implements Control {
     @Override
     public boolean execute() {
 
+        if (!NodeStateManager.getInstance().isInitialized()) {
+            NodeStateManager.getInstance().init(Network.size());
+        }
+
         // ── 1. Collecter et trier les nœuds par chordId ─────────────────────
         List<Node> nodeList = new ArrayList<>();
         for (int i = 0; i < Network.size(); i++) {
