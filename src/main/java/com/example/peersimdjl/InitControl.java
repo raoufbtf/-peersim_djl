@@ -3,12 +3,29 @@ package com.example.peersimdjl;
 import peersim.core.*;
 import java.util.*;
 
+/**
+ * Contrôle d'initialisation de l'anneau Chord au début de la simulation.
+ *
+ * Cette classe attribue les identifiants des nœuds, calcule `m`, construit
+ * la topologie circulaire (successeur/prédécesseur), remplit les finger tables
+ * et exécute un test de lookup initial.
+ */
 public class InitControl implements Control {
 
     private static final int CHORD_PROTOCOL_ID = 0;
 
+    /**
+     * Construit le contrôle d'initialisation.
+     *
+     * @param prefix Préfixe de configuration PeerSim (non utilisé ici).
+     */
     public InitControl(String prefix) {}
 
+    /**
+     * Exécute l'initialisation complète de l'overlay Chord.
+     *
+     * @return `false` pour laisser PeerSim poursuivre la simulation.
+     */
     @Override
     public boolean execute() {
 

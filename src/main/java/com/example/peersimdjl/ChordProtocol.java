@@ -7,7 +7,8 @@ public class ChordProtocol implements Protocol, CDProtocol {
 
     public static final int CHORD_PROTOCOL_ID = 0;
 
-    public static boolean DEBUGChord= false; // true pour activer les logs détaillés;
+    public static boolean DEBUGChord= true 
+    ; // true pour activer les logs détaillés;
 
     // ── Compteur statique pour générer des IDs uniques et permanents ────────
     private static int nextUniqueStringId = 0;  // N100, N101, N102, etc.
@@ -440,27 +441,32 @@ public class ChordProtocol implements Protocol, CDProtocol {
 
             // Identifier les clés qui doivent être migrées (celles entre predecessor et moi)
             for (java.util.Map.Entry<String, Object> entry : successorChord.localStorage.entrySet()) {
-                String hashedKey = entry.getKey();
-                int keyId = Integer.parseInt(hashedKey);
+                String logicalKey = entry.getKey();
+                int keyId;
+                try {
+                    keyId = Integer.parseInt(hashKey(logicalKey));
+                } catch (NumberFormatException ex) {
+                    continue;
+                }
 
                 // Une clé doit être migrée si elle appartient maintenant à ce nœud
                 if (isKeyMine(keyId)) {
-                    keysToMigrate.put(hashedKey, entry.getValue());
+                    keysToMigrate.put(logicalKey, entry.getValue());
                 }
             }
 
             // Migrer les clés identifiées
             for (java.util.Map.Entry<String, Object> entry : keysToMigrate.entrySet()) {
-                String hashedKey = entry.getKey();
+                String logicalKey = entry.getKey();
                 Object value = entry.getValue();
 
                 // Stocker localement
-                putLocal(hashedKey, value);
+                putLocal(logicalKey, value);
                 // Supprimer du successeur
-                successorChord.removeLocal(hashedKey);
+                successorChord.removeLocal(logicalKey);
 
                 if (DEBUGChord) {
-                    System.out.println("DATA MIGRATION: Key " + hashedKey + " migrated from Node " +
+                    System.out.println("DATA MIGRATION: Key " + logicalKey + " migrated from Node " +
                         successorChord.nodeIdString + " to Node " + nodeIdString);
                 }
             }
@@ -527,13 +533,13 @@ public class ChordProtocol implements Protocol, CDProtocol {
     private void migrateDataToSuccessor(ChordProtocol successorChord) {
         synchronized (localStorage) {
             for (java.util.Map.Entry<String, Object> entry : localStorage.entrySet()) {
-                String hashedKey = entry.getKey();
+                String logicalKey = entry.getKey();
                 Object value = entry.getValue();
 
-                successorChord.putLocal(hashedKey, value);
+                successorChord.putLocal(logicalKey, value);
 
                 if (DEBUGChord) {
-                    System.out.println("DATA MIGRATION: Key " + hashedKey + " migrated to successor Node " +
+                    System.out.println("DATA MIGRATION: Key " + logicalKey + " migrated to successor Node " +
                         successorChord.nodeIdString + " from leaving Node " + nodeIdString);
                 }
             }
@@ -547,6 +553,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
     // ════════════════════════════════════════════════════════════════════════
 
     public void traitementparnode() {
+        if (!DEBUGChord) return;
         for (int i = 1; i <= 10; i++) {
             System.out.println("Node " + nodeIdString + " traitementparnode: " + i);
         }
@@ -618,14 +625,14 @@ public class ChordProtocol implements Protocol, CDProtocol {
 
         if (responsibleNode == selfNode) {
             // Stockage local
-            putLocal(hashedKey, value);
+            putLocal(key, value);
             if (DEBUGChord) {
                 System.out.println("DHT PUT: Node " + nodeIdString + " stored key=" + key + " (hash=" + hashedKey + ") locally");
             }
         } else {
             // Envoi au nœud responsable (simulation simple pour PeerSim)
             ChordProtocol responsibleChord = (ChordProtocol) responsibleNode.getProtocol(CHORD_PROTOCOL_ID);
-            responsibleChord.putLocal(hashedKey, value);
+            responsibleChord.putLocal(key, value);
             if (DEBUGChord) {
                 System.out.println("DHT PUT: Node " + nodeIdString + " forwarded key=" + key + " (hash=" + hashedKey + ") to Node " + responsibleChord.nodeIdString);
             }
@@ -642,7 +649,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
 
         if (responsibleNode == selfNode) {
             // Récupération locale
-            Object value = getLocal(hashedKey);
+            Object value = getLocal(key);
             if (DEBUGChord) {
                 System.out.println("DHT GET: Node " + nodeIdString + " retrieved key=" + key + " (hash=" + hashedKey + ") locally: " + value);
             }
@@ -650,7 +657,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
         } else {
             // Demande au nœud responsable (simulation simple pour PeerSim)
             ChordProtocol responsibleChord = (ChordProtocol) responsibleNode.getProtocol(CHORD_PROTOCOL_ID);
-            Object value = responsibleChord.getLocal(hashedKey);
+            Object value = responsibleChord.getLocal(key);
             if (DEBUGChord) {
                 System.out.println("DHT GET: Node " + nodeIdString + " retrieved key=" + key + " (hash=" + hashedKey + ") from Node " + responsibleChord.nodeIdString + ": " + value);
             }
@@ -668,7 +675,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
 
         if (responsibleNode == selfNode) {
             // Suppression locale
-            Object value = removeLocal(hashedKey);
+            Object value = removeLocal(key);
             if (DEBUGChord) {
                 System.out.println("DHT REMOVE: Node " + nodeIdString + " removed key=" + key + " (hash=" + hashedKey + ") locally");
             }
@@ -676,7 +683,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
         } else {
             // Suppression sur le nœud responsable
             ChordProtocol responsibleChord = (ChordProtocol) responsibleNode.getProtocol(CHORD_PROTOCOL_ID);
-            Object value = responsibleChord.removeLocal(hashedKey);
+            Object value = responsibleChord.removeLocal(key);
             if (DEBUGChord) {
                 System.out.println("DHT REMOVE: Node " + nodeIdString + " removed key=" + key + " (hash=" + hashedKey + ") from Node " + responsibleChord.nodeIdString);
             }
@@ -693,10 +700,10 @@ public class ChordProtocol implements Protocol, CDProtocol {
         Node responsibleNode = findSuccessor(keyId);
 
         if (responsibleNode == selfNode) {
-            return containsLocal(hashedKey);
+            return containsLocal(key);
         } else {
             ChordProtocol responsibleChord = (ChordProtocol) responsibleNode.getProtocol(CHORD_PROTOCOL_ID);
-            return responsibleChord.containsLocal(hashedKey);
+            return responsibleChord.containsLocal(key);
         }
     }
 
@@ -704,6 +711,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
      * Affiche le contenu local du stockage DHT
      */
     public void printLocalStorage() {
+        if (!DEBUGChord) return;
         synchronized (localStorage) {
             System.out.println("Node " + nodeIdString + " local storage (" + localStorage.size() + " entries):");
             for (java.util.Map.Entry<String, Object> entry : localStorage.entrySet()) {
@@ -735,9 +743,9 @@ public class ChordProtocol implements Protocol, CDProtocol {
             if (replicaNode != null && isAlive(replicaNode)) {
                 ChordProtocol replicaChord = (ChordProtocol) replicaNode.getProtocol(CHORD_PROTOCOL_ID);
                 if (replicaChord != null) {
-                    replicaChord.putLocal(hashedKey, value);
+                    replicaChord.putLocal(key, value);
                     // Enregistrer cette réplique
-                    replicaChord.registerReplica(hashedKey, selfNode);
+                    replicaChord.registerReplica(key, selfNode);
                 }
             }
         }
@@ -765,7 +773,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
             if (replicaNode != null && isAlive(replicaNode)) {
                 ChordProtocol replicaChord = (ChordProtocol) replicaNode.getProtocol(CHORD_PROTOCOL_ID);
                 if (replicaChord != null) {
-                    Object value = replicaChord.getLocal(hashedKey);
+                    Object value = replicaChord.getLocal(key);
                     if (value != null) {
                         if (DEBUGChord) {
                             System.out.println("DHT GET REPLICATED: key=" + key + " (hash=" + hashedKey + ") retrieved from Node " + replicaChord.nodeIdString);
@@ -808,9 +816,9 @@ public class ChordProtocol implements Protocol, CDProtocol {
     /**
      * Enregistre qu'un nœud détient une réplique de cette clé
      */
-    private void registerReplica(String hashedKey, Node replicaNode) {
+    private void registerReplica(String logicalKey, Node replicaNode) {
         synchronized (keyReplicas) {
-            keyReplicas.computeIfAbsent(hashedKey, k -> new java.util.HashSet<>()).add(replicaNode);
+            keyReplicas.computeIfAbsent(logicalKey, k -> new java.util.HashSet<>()).add(replicaNode);
         }
     }
 
@@ -819,23 +827,28 @@ public class ChordProtocol implements Protocol, CDProtocol {
      */
     public void checkAndRepairReplication() {
         synchronized (localStorage) {
-            for (String hashedKey : localStorage.keySet()) {
-                int keyId = Integer.parseInt(hashedKey);
+            for (String logicalKey : localStorage.keySet()) {
+                int keyId;
+                try {
+                    keyId = Integer.parseInt(hashKey(logicalKey));
+                } catch (NumberFormatException ex) {
+                    continue;
+                }
                 Node primaryNode = findSuccessor(keyId);
 
                 if (primaryNode == selfNode) {
                     // Je suis le nœud responsable, vérifier la réplication
                     java.util.List<Node> expectedReplicas = getReplicaNodes(selfNode, REPLICATION_FACTOR);
-                    Object value = localStorage.get(hashedKey);
+                    Object value = localStorage.get(logicalKey);
 
                     for (Node replicaNode : expectedReplicas) {
                         if (replicaNode != selfNode && replicaNode != null && isAlive(replicaNode)) {
                             ChordProtocol replicaChord = (ChordProtocol) replicaNode.getProtocol(CHORD_PROTOCOL_ID);
-                            if (replicaChord != null && replicaChord.getLocal(hashedKey) == null) {
+                            if (replicaChord != null && replicaChord.getLocal(logicalKey) == null) {
                                 // Réplique manquante, la restaurer
-                                replicaChord.putLocal(hashedKey, value);
+                                replicaChord.putLocal(logicalKey, value);
                                 if (DEBUGChord) {
-                                    System.out.println("REPLICATION REPAIR: Restored key " + hashedKey + " on Node " + replicaChord.nodeIdString);
+                                    System.out.println("REPLICATION REPAIR: Restored key " + logicalKey + " on Node " + replicaChord.nodeIdString);
                                 }
                             }
                         }
@@ -863,7 +876,6 @@ public class ChordProtocol implements Protocol, CDProtocol {
             current = cp.successor;
         }
 
-        // ── affichage avec nodeIdString pour meilleur debugChord ──────────────────
         if (DEBUGChord) {
             StringBuilder sb = new StringBuilder("Node " + nodeIdString + " (PeerSim=" + selfNode.getIndex() + ") successorList: [");
             for (int j = 0; j < SUCCESSOR_LIST_SIZE; j++) {
@@ -877,20 +889,6 @@ public class ChordProtocol implements Protocol, CDProtocol {
             }
             sb.append("]");
             System.out.println(sb.toString());
-        
-            // Affichage simple quand DEBUGChord est false
-            StringBuilder sb1 = new StringBuilder("Node " + nodeIdString + " successorList: [");
-            for (int j = 0; j < SUCCESSOR_LIST_SIZE; j++) {
-                Node n = successorList[j];
-                if (n != null) {
-                    ChordProtocol cp = (ChordProtocol) n.getProtocol(CHORD_PROTOCOL_ID);
-                    sb1.append(cp != null ? cp.nodeIdString : "null").append(" ");
-                } else {
-                    sb1.append("null ");
-                }
-            }
-            sb1.append("]");
-            System.out.println(sb1.toString());
         }
     }
 
@@ -927,21 +925,7 @@ public class ChordProtocol implements Protocol, CDProtocol {
     // ════════════════════════════════════════════════════════════════════════
 
     public static void printNetworkState() {
-        if (!DEBUGChord) {
-            // Affichage simple quand DEBUGChord est false
-            StringBuilder sb = new StringBuilder("Nodes: [");
-            for (int i = 0; i < Network.size(); i++) {
-                Node n = Network.get(i);
-                ChordProtocol cp = (ChordProtocol) n.getProtocol(CHORD_PROTOCOL_ID);
-                if (cp != null) {
-                    sb.append(cp.nodeIdString);
-                    if (i < Network.size() - 1) sb.append(" ");
-                }
-            }
-            sb.append("]");
-            System.out.println(sb.toString());
-            return;
-        }
+        if (!DEBUGChord) return;
 
         System.out.println("── Network state (cycle " + simCycle + ") ──");
         for (int i = 0; i < Network.size(); i++) {

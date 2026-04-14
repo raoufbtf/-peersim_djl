@@ -4,6 +4,13 @@ import peersim.core.*;
 import peersim.config.*;
 import java.util.*;
 
+/**
+ * Contrôle dynamique de la simulation Chord.
+ *
+ * Gère les événements de vie du réseau (ajout/retrait/crash de nœuds),
+ * la stabilisation globale de l'anneau et différents scénarios de test
+ * (lookup, DHT, réplication, migration de données).
+ */
 public class DynamicControl implements Control {
 
     // Use the shared ChordProtocol debug flag for consistency
@@ -14,6 +21,11 @@ public class DynamicControl implements Control {
     private int    cycleCount = 0;
     private int    addCount   = 0;
 
+    /**
+     * Construit le contrôleur dynamique en lisant le PID Chord.
+     *
+     * @param prefix Préfixe de configuration PeerSim.
+     */
     public DynamicControl(String prefix) {
         this.pid = Configuration.getPid(prefix + ".pids");
     }
@@ -22,18 +34,27 @@ public class DynamicControl implements Control {
     //  UTILITAIRES  m
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Calcule la taille logique de l'espace d'identifiants (`m`).
+     */
     private int computeM(int networkSize) {
         if (networkSize <= 1) return 3;
         int m = (int) Math.ceil(Math.log(networkSize) / Math.log(2));
         return Math.max(3, m);
     }
 
+    /**
+     * Retourne la valeur courante de `m` à partir d'un nœud existant.
+     */
     private int getCurrentM() {
         if (Network.size() == 0) return 3;
         ChordProtocol c = (ChordProtocol) Network.get(0).getProtocol(pid);
         return (c != null) ? c.m : 3;
     }
 
+    /**
+     * Applique une nouvelle valeur de `m` à tous les nœuds et redimensionne les fingers.
+     */
     private void updateMForAllNodes(int newM) {
         for (int i = 0; i < Network.size(); i++) {
             ChordProtocol c = (ChordProtocol) Network.get(i).getProtocol(pid);
@@ -49,6 +70,9 @@ public class DynamicControl implements Control {
         stabilizeAllNodes();
     }
 
+    /**
+     * Vérifie la cohérence de `m` entre tous les nœuds du réseau.
+     */
     private void verifyM() {
         int expected = getCurrentM();
         for (int i = 0; i < Network.size(); i++) {
@@ -81,6 +105,9 @@ public class DynamicControl implements Control {
     //  STABILISATION GLOBALE
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Lance plusieurs rounds de stabilisation/fixFingers pour converger plus vite.
+     */
     private void stabilizeAllNodes() {
         // Plus de rounds pour que la correction se propage jusqu'aux nœuds distants
         for (int round = 0; round < 5; round++) {
@@ -99,6 +126,9 @@ public class DynamicControl implements Control {
     //  networkContains  (gardé ici aussi pour usage local)
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Vérifie si une référence de nœud est encore présente dans `Network`.
+     */
     private boolean networkContains(Node n) {
         for (int i = 0; i < Network.size(); i++) {
             if (Network.get(i) == n) return true;
@@ -110,6 +140,9 @@ public class DynamicControl implements Control {
     //  CRASH CIBLÉ PAR ID
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Supprime le nœud dont le ChordId correspond à `targetChordId`.
+     */
     private void crashNodeById(int targetChordId) {
         Node targetNode = null;
         int  targetIndex = -1;
@@ -145,6 +178,9 @@ public class DynamicControl implements Control {
     //  CRASH SIMULÉ
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Simule un crash aléatoire d'un nœud puis reconstruit la topologie.
+     */
     private void simulateCrash() {
         if (Network.size() <= 1) return;
 
@@ -183,6 +219,11 @@ public class DynamicControl implements Control {
     //  BOUCLE PRINCIPALE
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Exécute les actions dynamiques planifiées au cycle courant.
+     *
+     * @return `false` pour continuer la simulation.
+     */
     @Override
     public boolean execute() {
         cycleCount++;
@@ -217,6 +258,9 @@ public class DynamicControl implements Control {
     //  AJOUT D'UN NŒUD
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Ajoute un nouveau nœud au réseau, le fait joindre l'anneau et stabilise.
+     */
     private void addNewNode() {
         addCount++;
         int newId = 7 + addCount; // 8, 9, …
@@ -264,6 +308,9 @@ public class DynamicControl implements Control {
     //  SUPPRESSION VOLONTAIRE D'UN NŒUD
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Retire volontairement un nœud du réseau avec correction des pointeurs voisins.
+     */
     private void removeNode() {
         if (Network.size() <= 1) return;
 
@@ -300,6 +347,9 @@ public class DynamicControl implements Control {
     //  TEST LOOKUP
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Exécute un lookup aléatoire pour valider le routage Chord.
+     */
     private void testLookup() {
         if (Network.size() == 0) return;
         Node startNode = Network.get(rand.nextInt(Network.size()));
@@ -323,6 +373,9 @@ public class DynamicControl implements Control {
     //  AFFICHAGE ÉTAT RÉSEAU
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Affiche une vue synthétique de l'anneau au cycle courant.
+     */
     private void printNetworkState() {
         System.out.println("Network state at cycle " + cycleCount + ":");
         for (int i = 0; i < Network.size(); i++) {
@@ -340,6 +393,9 @@ public class DynamicControl implements Control {
     //  TESTS DHT
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Réalise un test minimal PUT/GET local-distribué sur la DHT.
+     */
     private void testSimpleDHT() {
         System.out.println("\n=== SIMPLE DHT TEST ===");
 
@@ -358,6 +414,9 @@ public class DynamicControl implements Control {
         System.out.println("=== SIMPLE DHT TEST END ===\n");
     }
 
+    /**
+     * Exécute une campagne basique PUT/GET sur plusieurs nœuds.
+     */
     private void testDHTBasic() {
         System.out.println("\n=== DHT BASIC TEST ===");
 
@@ -395,6 +454,9 @@ public class DynamicControl implements Control {
         System.out.println("=== DHT BASIC TEST END ===\n");
     }
 
+    /**
+     * Vérifie l'accessibilité des données après des changements topologiques.
+     */
     private void testDHTAfterCrash() {
         System.out.println("\n=== DHT AFTER CRASH TEST ===");
 
@@ -437,6 +499,9 @@ public class DynamicControl implements Control {
     //  TESTS RÉPLICATION ET MIGRATION
     // ════════════════════════════════════════════════════════════════════════
 
+    /**
+     * Teste les opérations PUT/GET avec réplication sur successeurs.
+     */
     private void testReplication() {
         System.out.println("\n=== REPLICATION TEST ===");
 
@@ -467,6 +532,9 @@ public class DynamicControl implements Control {
         System.out.println("=== REPLICATION TEST END ===\n");
     }
 
+    /**
+     * Teste la conservation de l'accès aux données après migration de clés.
+     */
     private void testDataMigration() {
         System.out.println("\n=== DATA MIGRATION TEST ===");
 
