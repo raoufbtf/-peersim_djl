@@ -580,6 +580,30 @@ public class ChordProtocol implements Protocol, CDProtocol {
     }
 
     /**
+     * Retourne l'identifiant numérique de la clé dans l'anneau Chord.
+     */
+    public int hashKeyToId(String key) {
+        return Integer.parseInt(hashKey(key));
+    }
+
+    /**
+     * Lookup explicite d'une clé logique vers son nœud responsable.
+     */
+    public Node lookup(String key) {
+        int keyId = hashKeyToId(key);
+        return findSuccessor(keyId);
+    }
+
+    /**
+     * Expose une copie de stockage local pour diagnostics/agrégation locale.
+     */
+    public java.util.Map<String, Object> snapshotLocalStorage() {
+        synchronized (localStorage) {
+            return new java.util.LinkedHashMap<>(localStorage);
+        }
+    }
+
+    /**
      * Stockage local d'une paire clé-valeur
      */
     public void putLocal(String key, Object value) {

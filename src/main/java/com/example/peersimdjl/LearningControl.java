@@ -46,6 +46,15 @@ public class LearningControl implements Control {
         private final java.util.Map<String, Integer> nodeLoadById = new java.util.LinkedHashMap<>();
         private final java.util.Random batchRandom = new java.util.Random();
         private int roundRobinCursor = 0;
+        private final java.util.Map<String, float[]> localWeightsByNodeId = new java.util.LinkedHashMap<>();
+        private final java.util.Map<String, Integer> datasetSizeByNodeId = new java.util.LinkedHashMap<>();
+        private final java.util.Map<String, LocalModelManager> modelsByNodeId = new java.util.LinkedHashMap<>();
+        private float[] previousGlobalModel = null;
+        private float[] currentGlobalModel = null;
+        private int federatedEpoch = 0;
+        private boolean convergenceReached = false;
+        private float learningRate = 0.05f;
+        private AccuracyTracker accuracyTracker = new AccuracyTracker();
 
         private LearningRunState(int runIndex, int requestedLearners, String datasetPath) {
             this.runIndex = runIndex;
@@ -58,6 +67,7 @@ public class LearningControl implements Control {
     private final DHTSessionManager dhtManager;         // Gestionnaire DHT
     private final int activeNodeCount;
     private final String datasetPath;
+    private final java.util.List<String> configuredDatasetPaths;
     
     // ── État de contrôle ────────────────────────────────────────
     @SuppressWarnings("unused")
@@ -90,6 +100,11 @@ public class LearningControl implements Control {
     private final java.util.Random batchRandom = new java.util.Random();
     private final BatchAssignmentStrategy batchAssignmentStrategy;
     private final int maxBatchesPerNode;
+    private final int federatedEpochLimit;
+    private final float initialLearningRate;
+    private final int configuredNumParams;
+    private final String configuredModelType;
+    private final boolean preprocessOnUpload;
     @SuppressWarnings("unused")
     private int roundRobinCursor = 0;
     private final java.util.List<LearningRunState> learningRuns = new java.util.ArrayList<>();
@@ -107,8 +122,20 @@ public class LearningControl implements Control {
         this.dhtManager = new DHTSessionManager(pid);
         this.activeNodeCount = Math.max(1, Configuration.getInt(prefix + ".activeNodeCount", 4));
         this.datasetPath = Configuration.getString(prefix + ".datasetPath", null);
+        java.util.List<String> parsedDatasetPaths = parseDatasetPaths(
+            Configuration.getString(prefix + ".datasetPaths", ""));
+        if (parsedDatasetPaths.isEmpty() && this.datasetPath != null && !this.datasetPath.trim().isEmpty()) {
+            parsedDatasetPaths.add(this.datasetPath.trim());
+        }
+        this.configuredDatasetPaths = parsedDatasetPaths;
         this.maxBatchesPerNode = Math.max(1,
                 Configuration.getInt(prefix + ".maxBatchesPerNode", DEFAULT_MAX_BATCHES_PER_NODE));
+        this.federatedEpochLimit = Math.max(1, Configuration.getInt(prefix + ".federatedEpochs", 3));
+        this.initialLearningRate = (float) Math.max(0.0001d,
+            Configuration.getDouble(prefix + ".learningRate", 0.05d));
+        this.configuredNumParams = Math.max(1, Configuration.getInt(prefix + ".numParams", 4));
+        this.configuredModelType = parseModelType(Configuration.getString(prefix + ".modelType", "MLP"));
+        this.preprocessOnUpload = Configuration.getBoolean(prefix + ".preprocessOnUpload", true);
         this.learningSessionCount = Math.max(1, Configuration.getInt(prefix + ".sessionCount", 1));
         this.sessionNodeRequirements = parseNodeRequirements(Configuration.getString(prefix + ".sessionRequirements", ""));
         String strategyName = Configuration.getString(prefix + ".batchStrategy", "ROUND_ROBIN");
@@ -167,7 +194,11 @@ public class LearningControl implements Control {
             }
 
             if (run.runningTransitionDone && !run.completionDone) {
-                transitionSessionToDone(run);
+                if (run.federatedEpoch >= federatedEpochLimit || run.convergenceReached) {
+                    transitionSessionToDone(run);
+                } else {
+                    executeFederatedEpoch(run);
+                }
             }
         }
 
@@ -187,10 +218,40 @@ public class LearningControl implements Control {
         }
 
         for (int i = 0; i < requirements.size(); i++) {
-            learningRuns.add(new LearningRunState(i, requirements.get(i), datasetPath));
+            String runDatasetPath = resolveDatasetPathForRun(i);
+            LearningRunState run = new LearningRunState(i, requirements.get(i), runDatasetPath);
+            run.learningRate = initialLearningRate;
+            learningRuns.add(run);
+            System.out.println("[LearningControl] ✓ Session " + (i + 1) + " dataset: " + runDatasetPath);
         }
         learningRunsInitialized = true;
         System.out.println("[LearningControl] ✓ Initialisation de " + learningRuns.size() + " apprentissages simultanés");
+    }
+
+    private String resolveDatasetPathForRun(int runIndex) {
+        if (configuredDatasetPaths.isEmpty()) {
+            return datasetPath;
+        }
+        if (runIndex < configuredDatasetPaths.size()) {
+            return configuredDatasetPaths.get(runIndex);
+        }
+        return configuredDatasetPaths.get(configuredDatasetPaths.size() - 1);
+    }
+
+    private java.util.List<String> parseDatasetPaths(String rawValue) {
+        java.util.List<String> paths = new java.util.ArrayList<>();
+        if (rawValue == null || rawValue.trim().isEmpty()) {
+            return paths;
+        }
+
+        String[] parts = rawValue.split(",");
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                paths.add(trimmed);
+            }
+        }
+        return paths;
     }
 
     /**
@@ -215,6 +276,17 @@ public class LearningControl implements Control {
         }
 
         return counts;
+    }
+
+    private String parseModelType(String rawValue) {
+        if (rawValue == null) {
+            return "MLP";
+        }
+        String normalized = rawValue.trim().toUpperCase(java.util.Locale.ROOT);
+        if ("CNN".equals(normalized)) {
+            return "CNN";
+        }
+        return "MLP";
     }
 
     /**
@@ -303,7 +375,7 @@ public class LearningControl implements Control {
 
         if (stored) {
             System.out.println("[LearningControl] ✓ Session stockée dans le DHT");
-            run.receivedDataset = buildReceivedDataset();
+            run.receivedDataset = buildReceivedDataset(run.request.csvDataset);
             if (run.receivedDataset == null || run.receivedDataset.length == 0) {
                 System.err.println("[LearningControl] ✗ Dataset requis introuvable/illisible. Initialisation session annulée.");
                 return;
@@ -313,8 +385,8 @@ public class LearningControl implements Control {
             System.out.println("[LearningControl] ✓ Dataset découpé en " + run.distributedBatches.size() + " batches");
             System.out.println("[LearningControl] ✓ Stratégie d'assignation : " + batchAssignmentStrategy);
             System.out.println("[LearningControl] ✓ Capacité max par node : " + maxBatchesPerNode);
-            if (datasetPath != null) {
-                System.out.println("[LearningControl] ✓ Dataset chargé depuis : " + datasetPath);
+            if (run.request.csvDataset != null) {
+                System.out.println("[LearningControl] ✓ Dataset chargé depuis : " + run.request.csvDataset);
             }
             run.sessionInitialized = true;
         } else {
@@ -347,15 +419,15 @@ public class LearningControl implements Control {
      * Charge le dataset depuis un fichier CSV fourni par l'utilisateur.
      * Si le fichier est absent, on retombe sur un dataset synthétique de secours.
      */
-    private double[][] buildReceivedDataset() {
-        if (datasetPath == null || datasetPath.trim().isEmpty()) {
+    private double[][] buildReceivedDataset(String datasetPathForRun) {
+        if (datasetPathForRun == null || datasetPathForRun.trim().isEmpty()) {
             System.err.println("[LearningControl] ✗ Aucun dataset fourni. Veuillez spécifier control.learning.datasetPath.");
             return null;
         }
 
-        double[][] fromFile = loadDatasetFromCsv(datasetPath.trim());
+        double[][] fromFile = loadDatasetFromCsv(datasetPathForRun.trim());
         if (fromFile == null || fromFile.length == 0) {
-            System.err.println("[LearningControl] ✗ Dataset vide ou invalide : " + datasetPath);
+            System.err.println("[LearningControl] ✗ Dataset vide ou invalide : " + datasetPathForRun);
             return null;
         }
         return fromFile;
@@ -365,7 +437,7 @@ public class LearningControl implements Control {
      * Charge un CSV numérique (lignes séparées par virgule ou point-virgule).
      */
     private double[][] loadDatasetFromCsv(String path) {
-        java.util.List<double[]> rows = new java.util.ArrayList<>();
+        java.util.List<String[]> rawRows = new java.util.ArrayList<>();
 
         java.io.File file = new java.io.File(path);
         if (!file.exists()) {
@@ -386,18 +458,28 @@ public class LearningControl implements Control {
                 }
 
                 String[] parts = line.split("[;,]");
-                double[] row = new double[parts.length];
                 for (int i = 0; i < parts.length; i++) {
-                    row[i] = Double.parseDouble(parts[i].trim());
+                    parts[i] = parts[i].trim();
                 }
-                rows.add(row);
+                rawRows.add(parts);
             }
         } catch (Exception e) {
             System.err.println("[LearningControl] ✗ Erreur lecture dataset CSV: " + e.getMessage());
             return null;
         }
 
-        return rows.toArray(new double[0][]);
+        if (rawRows.isEmpty()) {
+            return new double[0][];
+        }
+
+        DatasetPreprocessor.Result result = DatasetPreprocessor.preprocess(rawRows, preprocessOnUpload);
+        if (preprocessOnUpload) {
+            System.out.println("[LearningControl] ✓ Prétraitement dataset activé: header=" + result.headerSkipped
+                    + ", lignes=" + result.rowCount + ", colonnes=" + result.columnCount
+                    + ", colonnesCatégorielles=" + result.categoricalColumns
+                    + ", normalisation=" + result.normalized);
+        }
+        return result.data;
     }
 
     /**
@@ -565,6 +647,234 @@ public class LearningControl implements Control {
             }
         }
         return null;
+    }
+
+    /**
+     * Exécute une epoch FL complète sans thread, en 7 phases ordonnées.
+     */
+    private void executeFederatedEpoch(LearningRunState run) {
+        int epoch = run.federatedEpoch;
+        java.util.List<String> nodeIds = collectParticipantNodeIds(run);
+        int expectedContributors = nodeIds.size();
+        int numParams = inferNumParams(run);
+
+        System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch START =====");
+
+        for (ChordProtocol protocol : run.activeParticipants) {
+            String nodeId = protocol.nodeIdString;
+            float[] prevWeights = getOrInitLocalWeights(run, nodeId, numParams);
+            int datasetSize = run.datasetSizeByNodeId.getOrDefault(nodeId, inferDatasetSizeForNode(run, nodeId));
+            run.datasetSizeByNodeId.put(nodeId, datasetSize);
+
+            float[] newWeights = simulateLocalTraining(run, nodeId, prevWeights, datasetSize, epoch);
+
+            GradientPublisher publisher = new GradientPublisher(protocol, expectedContributors);
+            publisher.publishGradients(prevWeights, newWeights, epoch, nodeId, datasetSize);
+
+            run.localWeightsByNodeId.put(nodeId, newWeights);
+            run.accuracyTracker.evaluateLocal(newWeights, datasetSize, epoch, nodeId);
+        }
+
+        for (ChordProtocol protocol : run.activeParticipants) {
+            new DepotAggregator(protocol).checkAndAggregate(epoch);
+        }
+
+        float[] globalModel = null;
+        for (ChordProtocol protocol : run.activeParticipants) {
+            float[] collected = new GlobalModelCollector(protocol).collectGlobalModel(epoch, numParams, run.currentGlobalModel);
+            if (collected != null) {
+                globalModel = collected;
+                break;
+            }
+        }
+
+        if (globalModel == null) {
+            System.out.println("[EPOCH " + epoch + "] Modèle global incomplet, attente prochain cycle.");
+            return;
+        }
+
+        run.previousGlobalModel = run.currentGlobalModel;
+        run.currentGlobalModel = java.util.Arrays.copyOf(globalModel, globalModel.length);
+
+        int totalDatasetSize = sumDatasetSize(run);
+        run.accuracyTracker.evaluateGlobal(globalModel, totalDatasetSize, epoch);
+
+        for (ChordProtocol protocol : run.activeParticipants) {
+            ConvergenceVoter voter = new ConvergenceVoter(protocol);
+            ConvergenceVoter.Vote vote;
+            if (run.previousGlobalModel == null) {
+                vote = ConvergenceVoter.Vote.CONTINUE;
+            } else {
+                vote = voter.computeVote(globalModel, run.previousGlobalModel);
+            }
+            voter.publishVote(vote, epoch, protocol.nodeIdString);
+        }
+
+        VoteCollector.Decision decision = new VoteCollector(run.activeParticipants.get(0))
+                .collectAndDecide(epoch, nodeIds);
+
+        if (decision == VoteCollector.Decision.RESET_LR) {
+            run.learningRate = Math.max(0.0001f, run.learningRate * 0.5f);
+            System.out.println("[EPOCH " + epoch + "] divergence détectée -> learningRate=" + run.learningRate);
+        } else if (decision == VoteCollector.Decision.STOP_CONVERGED) {
+            run.convergenceReached = true;
+            System.out.println("[EPOCH " + epoch + "] quorum convergent atteint.");
+        }
+
+        for (String nodeId : nodeIds) {
+            run.localWeightsByNodeId.put(nodeId, java.util.Arrays.copyOf(globalModel, globalModel.length));
+        }
+
+        run.accuracyTracker.printEpochSummary(
+            run.currentSession != null ? run.currentSession.sessionId : null,
+            run.request != null ? run.request.csvDataset : null,
+            epoch);
+        System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch END =====");
+        run.federatedEpoch++;
+    }
+
+    private java.util.List<String> collectParticipantNodeIds(LearningRunState run) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        for (ChordProtocol protocol : run.activeParticipants) {
+            if (protocol != null && protocol.nodeIdString != null) {
+                ids.add(protocol.nodeIdString);
+            }
+        }
+        return ids;
+    }
+
+    private int inferNumParams(LearningRunState run) {
+        for (LocalModelManager model : run.modelsByNodeId.values()) {
+            if (model == null) {
+                continue;
+            }
+            float[] weights = model.getModelWeights();
+            if (weights != null && weights.length > 0) {
+                return weights.length;
+            }
+        }
+
+        if (run.receivedDataset != null && run.receivedDataset.length > 0 && run.receivedDataset[0] != null) {
+            int featureCount = Math.max(1, run.receivedDataset[0].length);
+            return Math.max(configuredNumParams, featureCount);
+        }
+        return configuredNumParams;
+    }
+
+    private float[] getOrInitLocalWeights(LearningRunState run, String nodeId, int numParams) {
+        float[] existing = run.localWeightsByNodeId.get(nodeId);
+        if (existing != null && existing.length == numParams) {
+            return java.util.Arrays.copyOf(existing, existing.length);
+        }
+
+        float[] base = run.currentGlobalModel;
+        if (base != null && base.length == numParams) {
+            return java.util.Arrays.copyOf(base, base.length);
+        }
+
+        float[] initialized = createInitialGlobalWeights(numParams, run.runIndex);
+        run.currentGlobalModel = java.util.Arrays.copyOf(initialized, initialized.length);
+        return initialized;
+    }
+
+    private float[] createInitialGlobalWeights(int numParams, int runIndex) {
+        float[] weights = new float[Math.max(1, numParams)];
+        long seed = 20260418L + runIndex;
+        java.util.Random random = new java.util.Random(seed);
+        for (int i = 0; i < weights.length; i++) {
+            weights[i] = (random.nextFloat() - 0.5f) * 0.1f;
+        }
+        return weights;
+    }
+
+    private float[] simulateLocalTraining(LearningRunState run, String nodeId, float[] prevWeights, int datasetSize, int epoch) {
+        // Récupérer ou créer le modèle local du nœud
+        LocalModelManager model = run.modelsByNodeId.get(nodeId);
+        if (model == null) {
+            // Initialiser un nouveau modèle MLP
+            int inputSize = prevWeights.length > 100 ? prevWeights.length : 20;
+            int outputSize = 1; // Classification binaire
+            int[] hiddenLayers = {128, 64};
+            model = new LocalModelManager(nodeId, inputSize, outputSize, hiddenLayers, run.learningRate, configuredModelType);
+            run.modelsByNodeId.put(nodeId, model);
+            System.out.println("[LearningControl] ✓ Modèle " + configuredModelType + " créé pour " + nodeId +
+                             ": " + inputSize + "-128-64-1");
+        }
+        
+        // Restaurer les poids précédents du modèle global
+        if (prevWeights != null && prevWeights.length > 0) {
+            model.setModelWeights(prevWeights);
+        }
+        
+        // Obtenir les données d'entraînement locales du nœud
+        double[][] localData = extractLocalTrainingData(run, nodeId);
+        if (localData == null || localData.length == 0) {
+            System.out.println("[LearningControl] ⚠ Pas de données pour " + nodeId + ", poids non changés");
+            return model.getModelWeights();
+        }
+        
+        // Entraîner le modèle local sur 1-3 epochs
+        int localEpochs = Math.min(3, Math.max(1, datasetSize / 50));
+        float loss = model.trainLocalModel(localData, localEpochs);
+        System.out.println("[LearningControl] [" + nodeId + "] Epoch " + epoch + 
+                         " Training Loss: " + String.format("%.6f", loss) + 
+                         " on " + localData.length + " samples");
+        
+        // Évaluer la précision locale
+        float accuracy = model.evaluateLocal(localData);
+        run.accuracyTracker.trackLocalAccuracy(nodeId, accuracy, epoch);
+        
+        // Retourner les nouveaux poids du modèle
+        return model.getModelWeights();
+    }
+    
+    /**
+     * Extrait les données d'entraînement locales pour un nœud.
+     */
+    private double[][] extractLocalTrainingData(LearningRunState run, String nodeId) {
+        java.util.List<double[]> localRows = new java.util.ArrayList<>();
+        
+        for (DataBatch batch : run.distributedBatches) {
+            if (batch == null || batch.data == null) {
+                continue;
+            }
+            if (!nodeId.equals(batch.assignedNodeIdString)) {
+                continue;
+            }
+            for (double[] row : batch.data) {
+                if (row != null) {
+                    localRows.add(row);
+                }
+            }
+        }
+        
+        if (localRows.isEmpty()) {
+            return null;
+        }
+        
+        double[][] result = new double[localRows.size()][];
+        for (int i = 0; i < localRows.size(); i++) {
+            result[i] = localRows.get(i);
+        }
+        return result;
+    }
+
+    private int inferDatasetSizeForNode(LearningRunState run, String nodeId) {
+        int size = 0;
+        for (DataBatch batch : run.distributedBatches) {
+            if (batch != null && nodeId.equals(batch.assignedNodeIdString) && batch.data != null) {
+                size += batch.data.length;
+            }
+        }
+        return Math.max(1, size);
+    }
+
+    private int sumDatasetSize(LearningRunState run) {
+        int total = 0;
+        for (String nodeId : run.datasetSizeByNodeId.keySet()) {
+            total += Math.max(0, run.datasetSizeByNodeId.getOrDefault(nodeId, 0));
+        }
+        return Math.max(1, total);
     }
 
     /**

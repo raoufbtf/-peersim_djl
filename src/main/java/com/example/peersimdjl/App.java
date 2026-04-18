@@ -3,10 +3,12 @@ package com.example.peersimdjl;
 import peersim.Simulator;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Scanner;
@@ -26,9 +28,11 @@ public class App {
      * Démarre la simulation PeerSim en mode interactif.
      * L'utilisateur fournit le dataset et le nombre de nœuds souhaité.
      *
-     * @param args Arguments CLI optionnels :
-     *             args[0] = chemin du dataset CSV,
+    * @param args Arguments CLI optionnels :
+    *             args[0] = chemin(s) dataset CSV (séparés par virgules),
      *             args[1] = nombre de nœuds.
+    *             args[2] = besoins sessions (ex: 2,6),
+    *             args[3] = type de modèle (`mlp` ou `cnn`).
      */
     public static void main(String[] args) {
         try {
@@ -40,9 +44,10 @@ public class App {
             Path configPath = buildInteractiveConfig(resolveConfigPath(), request);
 
             System.out.println("Démarrage de la simulation PeerSim...");
-            System.out.println("  Dataset: " + request.datasetPath);
+            System.out.println("  Datasets: " + request.datasetPaths);
             System.out.println("  Nœuds   : " + request.nodeCount);
             System.out.println("  Demandes: " + request.sessionNodeRequirements);
+            System.out.println("  Modèle  : " + request.modelType);
 
             Simulator.main(new String[]{configPath.toString()});
             System.out.println("Simulation terminée.");
@@ -61,8 +66,21 @@ public class App {
     private static String resolveConfigPath() throws URISyntaxException {
         URL resource = App.class.getClassLoader().getResource("peersim.cfg");
         if (resource != null) {
-            Path configPath = Paths.get(resource.toURI());
-            return configPath.toString();
+            if ("file".equalsIgnoreCase(resource.getProtocol())) {
+                Path configPath = Paths.get(resource.toURI());
+                return configPath.toString();
+            }
+
+            try (InputStream in = App.class.getClassLoader().getResourceAsStream("peersim.cfg")) {
+                if (in != null) {
+                    Path tempConfig = Files.createTempFile("peersim-config-", ".cfg");
+                    Files.copy(in, tempConfig, StandardCopyOption.REPLACE_EXISTING);
+                    tempConfig.toFile().deleteOnExit();
+                    return tempConfig.toString();
+                }
+            } catch (IOException e) {
+                throw new RuntimeException("Impossible de copier peersim.cfg depuis les ressources", e);
+            }
         }
 
         return "src/main/resources/peersim.cfg";
@@ -72,30 +90,36 @@ public class App {
      * Lit la demande de simulation depuis les arguments CLI ou l'entrée utilisateur.
      */
     private static SimulationRequest readSimulationRequest(String[] args) {
-        String datasetPath;
+        String datasetInput;
         int nodeCount;
         String sessionRequirements;
+        String modelType;
 
         if (args != null && args.length >= 3) {
-            datasetPath = args[0].trim();
+            datasetInput = args[0].trim();
             nodeCount = parsePositiveInt(args[1], 4);
             sessionRequirements = args[2].trim();
+            modelType = args.length >= 4 ? parseModelType(args[3]) : "MLP";
         } else {
             System.out.println("=== Mode démo PeerSim ===");
             try (Scanner scanner = new Scanner(System.in)) {
-                System.out.print("Chemin du dataset CSV: ");
-                datasetPath = scanner.nextLine().trim();
+                System.out.print("Chemin(s) dataset CSV (séparés par des virgules): ");
+                datasetInput = scanner.nextLine().trim();
 
                 System.out.print("Nombre total de nœuds du réseau: ");
                 nodeCount = parsePositiveInt(scanner.nextLine(), 4);
 
                 System.out.print("Nœuds requis par apprentissage (ex: 2,6): ");
                 sessionRequirements = scanner.nextLine().trim();
+
+                System.out.print("Type de modèle (mlp/cnn): ");
+                modelType = parseModelType(scanner.nextLine());
             }
         }
 
-        if (datasetPath.isEmpty()) {
-            datasetPath = "src/main/resources/sample_dataset.csv";
+        java.util.List<String> datasetPaths = parseDatasetPaths(datasetInput);
+        if (datasetPaths.isEmpty()) {
+            datasetPaths = java.util.Collections.singletonList("src/main/resources/sample_dataset.csv");
         }
 
         java.util.List<Integer> parsedRequirements = parseNodeRequirements(sessionRequirements);
@@ -103,7 +127,7 @@ public class App {
             parsedRequirements = java.util.Arrays.asList(2, 2);
         }
 
-        return new SimulationRequest(datasetPath, Math.max(1, nodeCount), parsedRequirements);
+        return new SimulationRequest(datasetPaths, Math.max(1, nodeCount), parsedRequirements, modelType);
     }
 
     /**
@@ -119,10 +143,12 @@ public class App {
         Map<String, String> overrides = new LinkedHashMap<>();
         overrides.put("network.size", String.valueOf(request.nodeCount));
         overrides.put("simulation.cycles", String.valueOf(Math.max(24, request.sessionNodeRequirements.size() * 12)));
-        overrides.put("control.learning.datasetPath", request.datasetPath.replace('\\', '/'));
+        overrides.put("control.learning.datasetPath", request.datasetPaths.get(0).replace('\\', '/'));
+        overrides.put("control.learning.datasetPaths", joinDatasetPaths(request.datasetPaths));
         overrides.put("control.learning.batchStrategy", "ROUND_ROBIN");
         overrides.put("control.learning.maxBatchesPerNode", "2");
         overrides.put("control.learning.sessionRequirements", joinRequirements(request.sessionNodeRequirements));
+        overrides.put("control.learning.modelType", request.modelType);
         overrides.put("control.learning.pid", "0");
 
         builder.append(System.lineSeparator())
@@ -146,6 +172,36 @@ public class App {
         } catch (Exception e) {
             return defaultValue;
         }
+    }
+
+    private static String parseModelType(String rawValue) {
+        if (rawValue == null) {
+            return "MLP";
+        }
+        String normalized = rawValue.trim().toUpperCase(java.util.Locale.ROOT);
+        if ("CNN".equals(normalized)) {
+            return "CNN";
+        }
+        return "MLP";
+    }
+
+    /**
+     * Parse une liste de chemins dataset séparés par des virgules.
+     */
+    private static java.util.List<String> parseDatasetPaths(String rawValue) {
+        java.util.List<String> datasets = new java.util.ArrayList<>();
+        if (rawValue == null || rawValue.trim().isEmpty()) {
+            return datasets;
+        }
+
+        String[] parts = rawValue.split(",");
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                datasets.add(trimmed);
+            }
+        }
+        return datasets;
     }
 
     /**
@@ -181,18 +237,32 @@ public class App {
         return builder.toString();
     }
 
+    private static String joinDatasetPaths(java.util.List<String> datasetPaths) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < datasetPaths.size(); i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(datasetPaths.get(i).replace('\\', '/'));
+        }
+        return builder.toString();
+    }
+
     /**
      * Demande utilisateur contenant les paramètres de la simulation.
      */
     private static final class SimulationRequest {
-        private final String datasetPath;
+        private final java.util.List<String> datasetPaths;
         private final int nodeCount;
         private final java.util.List<Integer> sessionNodeRequirements;
+        private final String modelType;
 
-        private SimulationRequest(String datasetPath, int nodeCount, java.util.List<Integer> sessionNodeRequirements) {
-            this.datasetPath = datasetPath;
+        private SimulationRequest(java.util.List<String> datasetPaths, int nodeCount, java.util.List<Integer> sessionNodeRequirements,
+                                  String modelType) {
+            this.datasetPaths = datasetPaths;
             this.nodeCount = nodeCount;
             this.sessionNodeRequirements = sessionNodeRequirements;
+            this.modelType = modelType;
         }
     }
 }

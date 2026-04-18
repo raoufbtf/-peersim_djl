@@ -100,6 +100,14 @@
             <version>1.7.36</version>
         </dependency>
 
+        <!-- ===== Tests ===== -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>
+            <scope>test</scope>
+        </dependency>
+
     </dependencies>
 
     <!-- ===================== -->
@@ -171,6 +179,15 @@
                 <version>3.1.0</version>
                 <configuration>
                     <mainClass>com.example.peersimdjl.App</mainClass>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <useModulePath>false</useModulePath>
                 </configuration>
             </plugin>
 
