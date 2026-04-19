@@ -499,6 +499,280 @@ maintenance de l’anneau (stabilization/fingers/successor list).
 
 ---
 
+## 9) `AbstractLocalModel`
+
+### Rôle
+Base commune pour les modèles locaux (préparation entrée/sortie + utilitaires numériques).
+
+### Méthodes
+- `protected AbstractLocalModel(double learningRate)` : initialise le taux d’apprentissage.
+- `protected void ensureInputDim(List<double[]> batch)` : valide/inférer la dimension d’entrée.
+- `protected void rememberBatch(List<double[]> batch)` : conserve le dernier batch reçu.
+- `protected double[] extractFeatures(double[] row)` : extrait les features d’une ligne.
+- `protected double extractTarget(double[] row)` : extrait la cible d’une ligne.
+- `protected double clip(double value, double min, double max)` : borne une valeur.
+- `protected double sigmoid(double value)` : applique la sigmoïde.
+
+---
+
+## 10) `AccuracyTracker`
+
+### Rôle
+Calcule et journalise des métriques locales/globales (accuracy, loss) par epoch.
+
+### Méthodes
+- `public void evaluateLocal(...)` : calcule les métriques du modèle local.
+- `public void trackLocalAccuracy(...)` : enregistre l’accuracy locale d’un nœud.
+- `public void evaluateGlobal(...)` : évalue le modèle global.
+- `public void printEpochSummary(...)` : imprime un résumé de fin d’epoch.
+- `private Metrics computeMetrics(...)` : routine de calcul interne.
+
+---
+
+## 11) `ActiveSession`
+
+### Rôle
+Objet runtime représentant une session active planifiée par `SessionQueueManager`.
+
+### Méthodes
+- Getters d’accès : `getRequest`, `getSessionId`, `getIdeNodeId`, `getIdeChordId`, `getIdeNodeIdString`, `getLearnerNodeIds`, `getLearnerChordIds`, `getLearningSession`.
+- `isCompleted()` : indique si la session est terminée.
+- `markCompleted()` : marque la session comme terminée.
+
+---
+
+## 12) `CnnModel`
+
+### Rôle
+Implémentation `FederatedLocalModel` orientée CNN via DJL.
+
+### Méthodes
+- Cycle principal : `trainBatch`, `evaluate`, `predict`, `getWeights`, `setWeights`, `close`.
+- Initialisation/infra : `initializeModel`, `ensureTrainer`, `getModelParameters`, `closeSilently`.
+- Prétraitement interne : `toCnnInput`, `normalizeInput`, `trainInternal`.
+
+---
+
+## 13) `ConvergenceVoter`
+
+### Rôle
+Produit et publie un vote de convergence à partir de 2 états globaux successifs.
+
+### Méthodes
+- `computeVote(...)` : calcule le vote (`CONVERGE/CONTINUE/DIVERGE`).
+- `publishVote(...)` : publie le vote dans le DHT.
+
+---
+
+## 14) `DatasetPreprocessor`
+
+### Rôle
+Prétraitement tabulaire : nettoyage, encodage catégoriel, normalisation min-max.
+
+### Méthodes
+- Entrée principale : `preprocess(List<String[]> rawRows, boolean enabled)`.
+- Parsing/alignement : `parseNumericStrict`, `maxColumns`, `alignRows`, `sanitize`.
+- Détection : `looksLikeHeader`, `isCategoricalColumn`, `safeToken`, `isNumeric`.
+- Conversion/scale : `parseNumber`, `normalizeMinMax`.
+
+---
+
+## 15) `DepotAggregator`
+
+### Rôle
+Agrège les dépôts de gradients d’un paramètre donné pour un epoch.
+
+### Méthodes
+- `checkAndAggregate(int epoch)` : déclenche l’agrégation si quorum atteint.
+
+---
+
+## 16) `DjlParameterCodec`
+
+### Rôle
+Codec NDArray DJL ↔ tableau `float[]` sérialisable.
+
+### Méthodes
+- `toFloatArray(NDArray array)` : extrait les valeurs.
+- `fromFloatArray(...)` : reconstruit un NDArray (avec ou sans `Shape`).
+
+---
+
+## 17) `FederatedDhtKeys`
+
+### Rôle
+Fabrique centralisée des clés DHT pour la logique FL.
+
+### Méthodes
+- `gradientKey(...)`, `globalKey(...)`, `voteKey(...)`, `decisionKey(...)`.
+
+---
+
+## 18) `FederatedLocalModel`
+
+### Rôle
+Interface commune des modèles fédérés locaux.
+
+### Méthodes
+- `trainBatch`, `evaluate`, `predict`, `getWeights`, `setWeights`, `close`.
+
+---
+
+## 19) `GlobalModelCollector`
+
+### Rôle
+Collecte le modèle global agrégé depuis les clés DHT d’un epoch.
+
+### Méthodes
+- `collectGlobalModel(int epoch, int numParams, float[] fallbackModel)`.
+
+---
+
+## 20) `GradientPublisher`
+
+### Rôle
+Publie les deltas de gradients locaux dans le DHT (sparse top-k possible).
+
+### Méthodes
+- `publishGradients(...)` : publie les gradients d’un nœud.
+- `selectTopKIndices(...)`, `indexOfMaxAbs(...)` : sélection des composantes à publier.
+- `publishSingleDelta(...)` : publication unitaire d’un paramètre.
+- `estimateHopCount(...)` : estimation coût réseau / routage.
+
+---
+
+## 21) `LocalModelManager`
+
+### Rôle
+Pilote le cycle d’un modèle local (init/train/eval/predict/poids).
+
+### Méthodes
+- Initialisation : `initializeModel`.
+- Cycle ML : `trainLocalModel`, `evaluateLocal`, `predict`.
+- Poids : `getModelWeights`, `setModelWeights`.
+- Utilitaires : `generateSimpleLabels`, `readObject`, `close`, `toString`.
+
+---
+
+## 22) `NeuralNetworkModel`
+
+### Rôle
+Implémentation MLP/NN de `FederatedLocalModel` via DJL.
+
+### Méthodes
+- Constructeurs : variantes `learningRate`, `inputDim`, architecture complète.
+- API modèle : `trainBatch`, `evaluate`, `predict`, `train`, `getWeights`, `setWeights`, `close`.
+- Paramètres : `getParameters`, `setParameters`, `computeLoss`, `getModelType`, `toString`.
+- Internes : `initializeModel`, `trainInternal`, `ensureTrainer`, `normalizeInput`, `clampTarget`, `getModelParameters`, `closeSilently`.
+
+---
+
+## 23) `NodeState`
+
+### Rôle
+État de disponibilité d’un nœud (occupé comme learner et/ou IDE).
+
+### Méthodes
+- Lecture état : `isBusyAsLearner`, `isBusyAsIDE`.
+- Marquage : `markAsLearner`, `markAsIDE`.
+- Libération : `releaseLearner`, `releaseIDE`.
+
+---
+
+## 24) `NodeStateManager`
+
+### Rôle
+Singleton de gestion globale des disponibilités des nœuds.
+
+### Méthodes
+- Cycle de vie : `getInstance`, `init`, `isInitialized`.
+- Sélection : `getAvailableLearners`, `getAvailableIDEs`.
+- Verrous métier : `markAsLearner`, `markAsIDE`, `releaseLearner`, `releaseIDE`.
+
+---
+
+## 25) `ParamDepot`
+
+### Rôle
+Accumule les contributions d’un paramètre pour un epoch puis agrège (FedAvg).
+
+### Méthodes
+- Ingestion/état : `addContribution`, `isComplete`, `missingContributors`, `debugState`.
+- Agrégation : `aggregate`, `isAggregated`, `getAggregatedValue`.
+- Getters : `getParamIndex`, `getEpoch`, `getExpectedContributors`, `getContributions`.
+
+---
+
+## 26) `ParamEntry`
+
+### Rôle
+Contribution unitaire d’un nœud (delta de gradient + checksum d’intégrité).
+
+### Méthodes
+- Getters : `getNodeId`, `getParamIndex`, `getEpoch`, `getGradientDelta`, `getDatasetSize`, `getTimestamp`, `getChecksum`.
+- Intégrité/sérialisation : `computeChecksum`, `toHex`, `writeObject`, `readObject`.
+- `toString()` : affichage diagnostic.
+
+---
+
+## 27) `SessionQueueManager`
+
+### Rôle
+Orchestre la file d’attente et l’allocation des sessions concurrentes.
+
+### Méthodes
+- API publique : `getInstance`, `tryStartSession`, `onSessionComplete`, `getActiveSessions`, `getWaitingQueueSnapshot`.
+- Planification interne : `tryStartSessionInternal`, `drainWaitingQueue`, `containsRequest`, `chooseLearners`, `joinNodes`, `chordProtocolForNodeIndex`, `logWaiting`.
+
+---
+
+## 28) `SessionRequest`
+
+### Rôle
+Objet de demande de session (ID, nombre de learners, dataset).
+
+### Méthodes
+- Constructeur `SessionRequest(...)` ; la classe expose aussi ses accesseurs métier.
+
+---
+
+## 29) `VoteCollector`
+
+### Rôle
+Collecte les votes de convergence et produit une décision de quorum.
+
+### Méthodes
+- `collectAndDecide(int epoch, List<String> allNodeIds)`.
+
+---
+
+## 30) Classes de test (`src/test/java/com/example/peersimdjl`)
+
+### `DatasetPreprocessorTest`
+- `shouldSkipHeaderEncodeCategoricalAndNormalize()` : valide le pipeline complet de prétraitement.
+- `shouldKeepNumericParsingWhenPreprocessDisabled()` : valide le mode sans prétraitement.
+
+### `DjlParameterCodecTest`
+- `shouldConvertArrayRoundTrip()` : valide la conversion aller/retour NDArray ↔ float[].
+
+### `FederatedLogicTest`
+- `convergenceVoterShouldReturnConvergeContinueDiverge()` : règles de vote.
+- `voteCollectorDecisionRulesShouldMatchSpec()` : règles de décision quorum.
+- `globalModelCollectorShouldReturnNullWhenIncomplete()` : collecte incomplète.
+- `globalModelCollectorShouldReturnArrayWhenComplete()` : collecte complète.
+- `paramEntryChecksumShouldBeStableForSameInputs()` : stabilité du checksum.
+
+### `FederatedScenarioIntegrationTest`
+- `scenarioShouldPublishAggregateAndDecideConsistently(int nodeCount)` : scénario FL intégré bout-en-bout.
+
+### `ParamDepotTest`
+- `aggregateShouldUseWeightedFedAvg()` : agrégation pondérée.
+- `addContributionShouldBeIdempotentPerNodeId()` : idempotence par nœud.
+- `completeAndMissingContributorsShouldBeConsistent()` : cohérence complétude/manquants.
+- `aggregateShouldFallbackToSimpleAverageWhenWeightsAreZero()` : fallback moyenne simple.
+
+---
+
 ## Remarque
 Cette documentation décrit les signatures et le comportement observé dans le code actuel.
 Si tu veux, je peux aussi te générer une **version UML (PlantUML)** à partir de ce même inventaire.
