@@ -483,7 +483,8 @@ public class LearningControl implements Control {
     }
 
     /**
-     * Découpe le dataset reçu en batches de taille fixe.
+     * Découpe le dataset reçu en batches stratifiés pour garder une distribution
+     * de labels équilibrée dans chaque batch.
      *
      * @return la liste des batches créés
      */
@@ -500,29 +501,66 @@ public class LearningControl implements Control {
                 : Math.max(1, run.activeParticipants.size());
         int targetBatchCount = Math.max(1, effectiveNodeCount);
         int effectiveBatchCount = Math.min(targetBatchCount, run.receivedDataset.length);
-        int baseBatchSize = run.receivedDataset.length / effectiveBatchCount;
-        int remainder = run.receivedDataset.length % effectiveBatchCount;
+        java.util.List<java.util.List<double[]>> batchRows = new java.util.ArrayList<>();
+        for (int i = 0; i < effectiveBatchCount; i++) {
+            batchRows.add(new java.util.ArrayList<>());
+        }
 
-        int start = 0;
-        for (int batchIndex = 0; batchIndex < effectiveBatchCount; batchIndex++) {
-            int batchSize = baseBatchSize + (batchIndex < remainder ? 1 : 0);
-            int end = start + batchSize;
-            double[][] batchData = new double[batchSize][];
+        java.util.Map<Integer, java.util.List<double[]>> rowsByLabel = new java.util.LinkedHashMap<>();
+        for (double[] row : run.receivedDataset) {
+            int label = extractLabelBucket(row);
+            rowsByLabel.computeIfAbsent(label, ignored -> new java.util.ArrayList<>()).add(row);
+        }
 
-            for (int i = start; i < end; i++) {
-                batchData[i - start] = java.util.Arrays.copyOf(run.receivedDataset[i], run.receivedDataset[i].length);
+        java.util.Random shuffleRandom = new java.util.Random(20260419L + run.runIndex);
+        for (java.util.List<double[]> labelRows : rowsByLabel.values()) {
+            java.util.Collections.shuffle(labelRows, shuffleRandom);
+            int batchCursor = 0;
+            for (double[] row : labelRows) {
+                batchRows.get(batchCursor % effectiveBatchCount).add(java.util.Arrays.copyOf(row, row.length));
+                batchCursor++;
             }
+        }
 
+        for (int batchIndex = 0; batchIndex < batchRows.size(); batchIndex++) {
+            java.util.List<double[]> rows = batchRows.get(batchIndex);
+            double[][] batchData = new double[rows.size()][];
+            for (int i = 0; i < rows.size(); i++) {
+                batchData[i] = rows.get(i);
+            }
             DataBatch batch = new DataBatch(run.currentSession.sessionId + "_batch_" + batchIndex, batchData);
             batches.add(batch);
-            start = end;
+        }
+
+        java.util.Map<Integer, java.util.Map<Integer, Integer>> batchLabelCounts = new java.util.LinkedHashMap<>();
+        for (int batchIndex = 0; batchIndex < batchRows.size(); batchIndex++) {
+            java.util.Map<Integer, Integer> labelCounts = new java.util.LinkedHashMap<>();
+            for (double[] row : batchRows.get(batchIndex)) {
+                int label = extractLabelBucket(row);
+                labelCounts.put(label, labelCounts.getOrDefault(label, 0) + 1);
+            }
+            batchLabelCounts.put(batchIndex, labelCounts);
         }
 
         System.out.println("[LearningControl] ✓ Split dynamique: " + run.receivedDataset.length
                 + " lignes, " + effectiveNodeCount + " nodes, targetBatchCount=" + targetBatchCount
                 + ", batchCount=" + batches.size());
+        System.out.println("[LearningControl] ✓ Répartition stratifiée des labels par batch: " + batchLabelCounts);
 
         return batches;
+    }
+
+    private int extractLabelBucket(double[] row) {
+        if (row == null || row.length == 0) {
+            return 0;
+        }
+
+        double labelValue = row[row.length - 1];
+        if (Double.isNaN(labelValue) || Double.isInfinite(labelValue)) {
+            return 0;
+        }
+
+        return (int) Math.round(labelValue);
     }
 
     /**
@@ -672,7 +710,6 @@ public class LearningControl implements Control {
             publisher.publishGradients(prevWeights, newWeights, epoch, nodeId, datasetSize);
 
             run.localWeightsByNodeId.put(nodeId, newWeights);
-            run.accuracyTracker.evaluateLocal(newWeights, datasetSize, epoch, nodeId);
         }
 
         for (ChordProtocol protocol : run.activeParticipants) {
@@ -719,6 +756,7 @@ public class LearningControl implements Control {
         } else if (decision == VoteCollector.Decision.STOP_CONVERGED) {
             run.convergenceReached = true;
             System.out.println("[EPOCH " + epoch + "] quorum convergent atteint.");
+            compareGlobalModelOnLocalBatches(run, epoch);
         }
 
         for (String nodeId : nodeIds) {
@@ -731,6 +769,52 @@ public class LearningControl implements Control {
             epoch);
         System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch END =====");
         run.federatedEpoch++;
+    }
+
+    private void compareGlobalModelOnLocalBatches(LearningRunState run, int epoch) {
+        if (run.currentGlobalModel == null || run.currentGlobalModel.length == 0) {
+            System.out.println("[EPOCH " + epoch + "] Comparaison globale ignorée: modèle global vide");
+            return;
+        }
+
+        System.out.println("[EPOCH " + epoch + "] ===== Compare global vs local on batches =====");
+        for (DataBatch batch : run.distributedBatches) {
+            if (batch == null || batch.data == null || batch.data.length == 0) {
+                continue;
+            }
+
+            String nodeId = batch.assignedNodeIdString != null ? batch.assignedNodeIdString : batch.processingNodeIdString;
+            if (nodeId == null) {
+                nodeId = "unknown";
+            }
+
+            LocalModelManager model = run.modelsByNodeId.get(nodeId);
+            if (model == null) {
+                System.out.println("[EPOCH " + epoch + "][COMPARE] batch=" + batch.batchId + " node=" + nodeId
+                        + " local model unavailable");
+                continue;
+            }
+
+            float[] localWeights = model.getModelWeights();
+            if (localWeights == null) {
+                localWeights = new float[0];
+            }
+
+            try {
+                model.setModelWeights(run.currentGlobalModel);
+                float globalAccuracy = model.evaluateAccuracy(batch.data);
+
+                model.setModelWeights(localWeights);
+                float localAccuracy = model.evaluateAccuracy(batch.data);
+
+                float delta = globalAccuracy - localAccuracy;
+                System.out.printf("[EPOCH %d][COMPARE] batch=%s node=%s rows=%d localAcc=%.4f globalAcc=%.4f delta=%.4f%n",
+                        epoch, batch.batchId, nodeId, batch.rowCount(), localAccuracy, globalAccuracy, delta);
+            } finally {
+                model.setModelWeights(localWeights);
+            }
+        }
+        System.out.println("[EPOCH " + epoch + "] ===== End compare global vs local =====");
     }
 
     private java.util.List<String> collectParticipantNodeIds(LearningRunState run) {
@@ -788,11 +872,21 @@ public class LearningControl implements Control {
     }
 
     private float[] simulateLocalTraining(LearningRunState run, String nodeId, float[] prevWeights, int datasetSize, int epoch) {
+        // Obtenir les données d'entraînement locales du nœud
+        double[][] localData = extractLocalTrainingData(run, nodeId);
+        if (localData == null || localData.length == 0) {
+            System.out.println("[LearningControl] ⚠ Pas de données pour " + nodeId + ", poids non changés");
+            return prevWeights != null ? java.util.Arrays.copyOf(prevWeights, prevWeights.length) : new float[0];
+        }
+
         // Récupérer ou créer le modèle local du nœud
         LocalModelManager model = run.modelsByNodeId.get(nodeId);
         if (model == null) {
-            // Initialiser un nouveau modèle MLP
-            int inputSize = prevWeights.length > 100 ? prevWeights.length : 20;
+            // Initialiser un nouveau modèle avec une dimension d'entrée cohérente dataset
+            int inputSize = 1;
+            if (localData[0] != null) {
+                inputSize = Math.max(1, localData[0].length - 1);
+            }
             int outputSize = 1; // Classification binaire
             int[] hiddenLayers = {128, 64};
             model = new LocalModelManager(nodeId, inputSize, outputSize, hiddenLayers, run.learningRate, configuredModelType);
@@ -804,13 +898,6 @@ public class LearningControl implements Control {
         // Restaurer les poids précédents du modèle global
         if (prevWeights != null && prevWeights.length > 0) {
             model.setModelWeights(prevWeights);
-        }
-        
-        // Obtenir les données d'entraînement locales du nœud
-        double[][] localData = extractLocalTrainingData(run, nodeId);
-        if (localData == null || localData.length == 0) {
-            System.out.println("[LearningControl] ⚠ Pas de données pour " + nodeId + ", poids non changés");
-            return model.getModelWeights();
         }
         
         // Entraîner le modèle local sur 1-3 epochs

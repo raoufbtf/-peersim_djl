@@ -13,7 +13,7 @@ Ce document explique **chaque classe** et **chaque méthode** du package:
 ### Rôle
 Point d’entrée de l’application. Lance PeerSim avec `peersim.cfg`.
 En mode démo, demande le dataset et le nombre de nœuds, puis génère un config temporaire.
-La démo peut aussi lancer **2 apprentissages successifs** pour visualiser le comportement.
+La démo peut aussi lancer plusieurs apprentissages successifs pour visualiser le comportement.
 
 ### Méthodes
 
@@ -21,10 +21,14 @@ La démo peut aussi lancer **2 apprentissages successifs** pour visualiser le co
   - Démarre la simulation PeerSim.
   - Lit le dataset et le nombre de nœuds si aucun argument CLI n’est fourni.
   - Désactive le debug Chord pour n’afficher que les logs d’apprentissage.
+  - Accepte plusieurs chemins CSV séparés par des virgules pour lancer plusieurs sessions.
   - Génère un fichier de configuration temporaire puis appelle `Simulator.main(...)`.
 
 ### Configuration de démo
-- `control.learning.sessionCount = 2` pour enchaîner deux apprentissages.
+- `control.learning.sessionCount = N` pour enchaîner plusieurs apprentissages.
+- `control.learning.datasetPaths` permet de fournir plusieurs datasets.
+- `control.learning.sessionRequirements` définit le nombre de learners requis par session.
+- `control.learning.modelType` choisit le type de modèle (`MLP` ou `CNN`).
 
 - `private static String resolveConfigPath() throws URISyntaxException`
   - Cherche `peersim.cfg` dans les ressources (`ClassLoader`).
@@ -217,6 +221,7 @@ Le dataset est **requis** via `control.learning.datasetPath`.
   - Sélectionne participants actifs.
   - Stocke la session dans le DHT.
   - Charge/synthétise dataset et découpe en batchs.
+  - Prépare une session par dataset configuré.
 
 - `private List<ChordProtocol> selectActiveParticipants()`
   - Sélectionne les participants actifs (IDE prioritaire).
@@ -224,13 +229,15 @@ Le dataset est **requis** via `control.learning.datasetPath`.
 - `private double[][] buildReceivedDataset()`
   - Charge le dataset CSV fourni par le chercheur.
   - Retourne `null` si aucun dataset n’est fourni ou si le fichier est invalide.
+  - Utilise le prétraitement commun `DatasetPreprocessor` sans changer le pipeline.
 
 - `private double[][] loadDatasetFromCsv(String path)`
   - Parse un CSV numérique (`,` ou `;`) en matrice `double[][]`.
 
 - `private List<DataBatch> splitDataset()`
-  - Découpe le dataset dynamiquement selon le nombre de nœuds ciblés.
-  - En pratique: nombre de batchs piloté par `activeNodeCount` (ou participants actifs).
+  - Découpe le dataset en batches **stratifiés par label**.
+  - Répartit les exemples de chaque classe de manière équilibrée dans tous les batches.
+  - Évite qu’un batch contienne presque une seule classe.
 
 - `private void assignBatchToNodes()`
   - Assigne chaque batch à un nœud selon la stratégie choisie et stocke via DHT.
@@ -250,6 +257,12 @@ Le dataset est **requis** via `control.learning.datasetPath`.
 - `private void transitionSessionToDone()`
   - Récupère session du DHT, passe en `DONE`, restocke.
   - Après succès, supprime les batchs physiques CSV et leurs références DHT.
+
+### Modifications récentes
+- Gestion de plusieurs datasets dans une seule exécution.
+- Sessions multiples lancées séquentiellement selon `sessionRequirements`.
+- Batches équilibrés par label au lieu d’une découpe séquentielle.
+- Prétraitement partagé conservé pour tous les datasets.
 
 ---
 
@@ -519,13 +532,17 @@ Base commune pour les modèles locaux (préparation entrée/sortie + utilitaires
 
 ### Rôle
 Calcule et journalise des métriques locales/globales (accuracy, loss) par epoch.
+Les valeurs affichées proviennent maintenant de l’accuracy réelle du modèle.
 
 ### Méthodes
-- `public void evaluateLocal(...)` : calcule les métriques du modèle local.
-- `public void trackLocalAccuracy(...)` : enregistre l’accuracy locale d’un nœud.
-- `public void evaluateGlobal(...)` : évalue le modèle global.
+- `public void evaluateLocal(...)` : conserve l’ancienne signature, sans recalcul artificiel.
+- `public void trackLocalAccuracy(...)` : enregistre la **vraie accuracy** d’un nœud.
+- `public void evaluateGlobal(...)` : calcule la métrique globale à partir des accuracies locales réelles.
 - `public void printEpochSummary(...)` : imprime un résumé de fin d’epoch.
-- `private Metrics computeMetrics(...)` : routine de calcul interne.
+
+### Modifications récentes
+- Suppression de la métrique artificielle basée sur les poids.
+- Moyenne globale calculée à partir des vraies accuracies locales.
 
 ---
 
@@ -645,12 +662,18 @@ Publie les deltas de gradients locaux dans le DHT (sparse top-k possible).
 
 ### Rôle
 Pilote le cycle d’un modèle local (init/train/eval/predict/poids).
+Le modèle utilise la dernière colonne du CSV comme label et les autres colonnes comme features.
 
 ### Méthodes
 - Initialisation : `initializeModel`.
 - Cycle ML : `trainLocalModel`, `evaluateLocal`, `predict`.
 - Poids : `getModelWeights`, `setModelWeights`.
-- Utilitaires : `generateSimpleLabels`, `readObject`, `close`, `toString`.
+- Utilitaires : `readObject`, `close`, `toString`.
+
+### Modifications récentes
+- Split automatique `train/validation` avant l’entraînement.
+- Utilisation des vraies labels du dataset au lieu de labels synthétiques.
+- Évaluation locale calculée sur les vraies features/labels.
 
 ---
 

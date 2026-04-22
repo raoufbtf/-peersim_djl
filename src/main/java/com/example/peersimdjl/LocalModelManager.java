@@ -17,6 +17,7 @@ public class LocalModelManager implements Serializable {
     private static final long serialVersionUID = 1L;
     private static final String TAG = "[LocalModelManager]";
     private static final boolean DEBUG = true;
+    private static final double TRAIN_SPLIT_RATIO = 0.8;
     
     private final String nodeId;
     private final int inputSize;
@@ -28,6 +29,7 @@ public class LocalModelManager implements Serializable {
     // Non-serializable: recréé après désérialisation
     private transient FederatedLocalModel model;
     private transient int trainingIterations = 0;
+    private transient float lastValidationAccuracy = Float.NaN;
     
     public LocalModelManager(String nodeId, int inputSize, int outputSize,
                              int[] hiddenLayers, float learningRate, String modelType) {
@@ -72,14 +74,29 @@ public class LocalModelManager implements Serializable {
         if (trainingData == null || trainingData.length == 0 || model == null) {
             return Float.NaN;
         }
-        
-        // Pour simplifier: utilise les mêmes données comme labels (autoencoder-like)
-        // Ou on peut créer des labels binaires simples
-        double[][] labels = generateSimpleLabels(trainingData);
+
+        double[][] shuffled = java.util.Arrays.copyOf(trainingData, trainingData.length);
+        java.util.Collections.shuffle(java.util.Arrays.asList(shuffled),
+                new java.util.Random((long) nodeId.hashCode() + trainingIterations));
+
+        int splitIndex = Math.max(1, (int) Math.floor(shuffled.length * TRAIN_SPLIT_RATIO));
+        if (splitIndex >= shuffled.length && shuffled.length > 1) {
+            splitIndex = shuffled.length - 1;
+        }
+
+        double[][] trainRows = java.util.Arrays.copyOfRange(shuffled, 0, splitIndex);
+        double[][] validationRows = splitIndex < shuffled.length
+                ? java.util.Arrays.copyOfRange(shuffled, splitIndex, shuffled.length)
+                : trainRows;
+
+        double[][] trainFeatures = extractFeatures(trainRows);
+        double[][] trainLabels = extractLabels(trainRows);
+        double[][] validationFeatures = extractFeatures(validationRows);
+        double[][] validationLabels = extractLabels(validationRows);
         
         float finalLoss = 0f;
         for (int epoch = 0; epoch < numEpochs; epoch++) {
-            float batchLoss = model.trainBatch(trainingData, labels);
+            float batchLoss = model.trainBatch(trainFeatures, trainLabels);
             finalLoss = batchLoss;
             trainingIterations++;
             if (DEBUG && epoch % Math.max(1, numEpochs/3) == 0) {
@@ -87,25 +104,62 @@ public class LocalModelManager implements Serializable {
                                    " Loss: " + String.format("%.6f", finalLoss));
             }
         }
+
+        lastValidationAccuracy = model.evaluate(validationFeatures, validationLabels);
+        if (DEBUG) {
+            System.out.println(TAG + " [" + nodeId + "] Validation Accuracy: "
+                    + String.format("%.4f", lastValidationAccuracy)
+                    + " (train=" + trainRows.length + ", val=" + validationRows.length + ")");
+        }
         
         return finalLoss;
     }
-    
-    /**
-     * Crée des labels simples à partir des données.
-     * Pour test: classifie si moyenne > 0.5 (binaire).
-     */
-    private double[][] generateSimpleLabels(double[][] data) {
-        double[][] labels = new double[data.length][outputSize];
-        for (int i = 0; i < data.length; i++) {
-            double mean = 0;
-            for (int j = 0; j < data[i].length; j++) {
-                mean += data[i][j];
+
+    private double[][] extractFeatures(double[][] rows) {
+        if (rows == null || rows.length == 0) {
+            return new double[0][0];
+        }
+
+        int featureCount = 1;
+        for (double[] row : rows) {
+            if (row != null && row.length > 1) {
+                featureCount = Math.max(1, row.length - 1);
+                break;
             }
-            mean /= data[i].length;
-            
-            // Classification binaire: outputSize=1
-            labels[i][0] = mean > 0.5 ? 1.0 : 0.0;
+            if (row != null && row.length == 1) {
+                featureCount = 1;
+            }
+        }
+
+        double[][] features = new double[rows.length][featureCount];
+        for (int i = 0; i < rows.length; i++) {
+            double[] row = rows[i];
+            if (row == null || row.length == 0) {
+                continue;
+            }
+
+            int maxFeatureIndexExclusive = row.length > 1 ? row.length - 1 : row.length;
+            for (int j = 0; j < featureCount; j++) {
+                features[i][j] = j < maxFeatureIndexExclusive ? row[j] : 0.0;
+            }
+        }
+        return features;
+    }
+
+    private double[][] extractLabels(double[][] rows) {
+        if (rows == null || rows.length == 0) {
+            return new double[0][1];
+        }
+
+        double[][] labels = new double[rows.length][1];
+        for (int i = 0; i < rows.length; i++) {
+            double[] row = rows[i];
+            if (row == null || row.length == 0) {
+                labels[i][0] = 0.0;
+                continue;
+            }
+            double rawLabel = row[row.length - 1];
+            labels[i][0] = rawLabel >= 0.5 ? 1.0 : 0.0;
         }
         return labels;
     }
@@ -135,14 +189,22 @@ public class LocalModelManager implements Serializable {
      * Évalue la précision locale.
      */
     public float evaluateLocal(double[][] testData) {
-        if (testData == null || testData.length == 0 || model == null) {
-            return 0f;
-        }
-        double[][] labels = generateSimpleLabels(testData);
-        float acc = model.evaluate(testData, labels);
+        float acc = evaluateAccuracy(testData);
         if (DEBUG) System.out.println(TAG + " [" + nodeId + "] Local Accuracy: " + 
                                       String.format("%.4f", acc));
         return acc;
+    }
+
+    /**
+     * Évalue la précision sur un jeu de données sans afficher de log.
+     */
+    public float evaluateAccuracy(double[][] testData) {
+        if (testData == null || testData.length == 0 || model == null) {
+            return 0f;
+        }
+        double[][] features = extractFeatures(testData);
+        double[][] labels = extractLabels(testData);
+        return model.evaluate(features, labels);
     }
     
     /**
@@ -171,6 +233,7 @@ public class LocalModelManager implements Serializable {
     private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, ClassNotFoundException {
         in.defaultReadObject();
         trainingIterations = 0;
+        lastValidationAccuracy = Float.NaN;
         initializeModel();
         if (DEBUG) System.out.println(TAG + " [" + nodeId + "] ✓ Désérialisé et modèle recréé");
     }

@@ -8,6 +8,9 @@ import java.util.Map;
  */
 public class AccuracyTracker {
 
+    private static final double MIN_VALID_ACCURACY = 0.0;
+    private static final double MAX_VALID_ACCURACY = 1.0;
+
     private static final class Metrics {
         private final double accuracy;
         private final double loss;
@@ -22,25 +25,48 @@ public class AccuracyTracker {
     private final Map<Integer, Metrics> globalByEpoch = new LinkedHashMap<>();
 
     public void evaluateLocal(float[] localParams, int datasetSize, int epoch, String nodeId) {
-        Metrics metrics = computeMetrics(localParams, datasetSize);
-        localByEpoch.computeIfAbsent(epoch, ignored -> new LinkedHashMap<>()).put(nodeId, metrics);
-        System.out.printf("[EPOCH %d][Node %s] local accuracy=%.4f loss=%.6f (dataset=%d)%n",
-                epoch, nodeId, metrics.accuracy, metrics.loss, datasetSize);
+        if (localParams == null || localParams.length == 0) {
+            System.out.printf("[EPOCH %d][Node %s] local metrics unavailable (dataset=%d)%n",
+                epoch, nodeId, datasetSize);
+            return;
+        }
+
+        System.out.printf("[EPOCH %d][Node %s] local metrics available but ignored: use trackLocalAccuracy() for real values (dataset=%d)%n",
+            epoch, nodeId, datasetSize);
     }
     
     /**
      * Enregistre la précision locale du modèle neuronal réel.
      */
     public void trackLocalAccuracy(String nodeId, float accuracy, int epoch) {
-        Metrics metrics = new Metrics(accuracy, 1.0 - accuracy); // loss = 1 - accuracy pour simplifier
+        double clippedAccuracy = Math.max(MIN_VALID_ACCURACY, Math.min(MAX_VALID_ACCURACY, accuracy));
+        Metrics metrics = new Metrics(clippedAccuracy, 1.0 - clippedAccuracy);
         localByEpoch.computeIfAbsent(epoch, ignored -> new LinkedHashMap<>()).put(nodeId, metrics);
-        System.out.printf("[EPOCH %d][Node %s] MLP accuracy=%.4f%n", epoch, nodeId, accuracy);
+        System.out.printf("[EPOCH %d][Node %s] real accuracy=%.4f%n", epoch, nodeId, clippedAccuracy);
     }
 
     public void evaluateGlobal(float[] globalParams, int totalDatasetSize, int epoch) {
-        Metrics metrics = computeMetrics(globalParams, totalDatasetSize);
+        Map<String, Metrics> localMetrics = localByEpoch.get(epoch);
+        Metrics metrics;
+
+        if (localMetrics == null || localMetrics.isEmpty()) {
+            metrics = new Metrics(0.0, 1.0);
+        } else {
+            double sumAccuracy = 0.0;
+            double sumLoss = 0.0;
+            int count = 0;
+
+            for (Metrics value : localMetrics.values()) {
+                sumAccuracy += value.accuracy;
+                sumLoss += value.loss;
+                count++;
+            }
+
+            metrics = new Metrics(sumAccuracy / count, sumLoss / count);
+        }
+
         globalByEpoch.put(epoch, metrics);
-        System.out.printf("[EPOCH %d][GLOBAL] accuracy=%.4f loss=%.6f (dataset=%d)%n",
+        System.out.printf("[EPOCH %d][GLOBAL] real accuracy=%.4f real loss=%.6f (dataset=%d)%n",
                 epoch, metrics.accuracy, metrics.loss, totalDatasetSize);
     }
 
@@ -70,20 +96,4 @@ public class AccuracyTracker {
         System.out.println("========================================");
     }
 
-    private Metrics computeMetrics(float[] params, int datasetSize) {
-        if (params == null || params.length == 0) {
-            return new Metrics(0.0, 1.0);
-        }
-
-        double sumAbs = 0.0;
-        for (float value : params) {
-            sumAbs += Math.abs(value);
-        }
-
-        double meanAbs = sumAbs / params.length;
-        double sampleFactor = Math.max(1.0, Math.log10(Math.max(10, datasetSize)));
-        double loss = meanAbs / sampleFactor;
-        double accuracy = 1.0 / (1.0 + loss);
-        return new Metrics(accuracy, loss);
-    }
 }
