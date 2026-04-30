@@ -5,6 +5,7 @@ import LaunchForm from "./components/LaunchForm";
 import EventFeed from "./components/EventFeed";
 import AccuracyChart from "./components/AccuracyChart";
 import NetworkTraceGraph from "./components/NetworkTraceGraph";
+import LearningStepIndicator from "./components/LearningStepIndicator";
 import ParamHeatmap from "./components/ParamHeatmap";
 
 function Sidebar({ onStart, onStop, onClear, globalDelay, setGlobalDelay, isPaused, setIsPaused, eventFilters, setEventFilters }) {
@@ -250,9 +251,9 @@ function NetworkPanel({ networkStats, communications, sessionNodes }) {
       )}
       <div style={{ marginTop: 16, borderTop: "1px solid #F3F4F6", paddingTop: 12 }}>
         <h4 style={{ margin: "0 0 8px", fontSize: "0.9rem", color: "#374151" }}>Recent Communications</h4>
-        <div style={{ maxHeight: 180, overflowY: "auto", fontSize: "0.8rem" }}>
+        <div style={{ maxHeight: 300, overflowY: "auto", fontSize: "0.8rem" }}>
           {(communications || []).length === 0 && <div style={{ color: "#9CA3AF" }}>No communications yet.</div>}
-          {(communications || []).slice(-20).reverse().map((comm) => (
+          {(communications || []).slice(-50).reverse().map((comm) => (
             <div
               key={comm.id}
               style={{
@@ -285,6 +286,12 @@ function NetworkPanel({ networkStats, communications, sessionNodes }) {
               )}
               {comm.samples && (
                 <span style={{ color: "#6B7280", fontSize: "0.7rem" }}>rows={comm.samples}</span>
+              )}
+              {comm.paramIndex && (
+                <span style={{ color: "#3B82F6", fontSize: "0.7rem", marginLeft: 4 }}>P{comm.paramIndex}</span>
+              )}
+              {comm.targetIndex && (
+                <span style={{ color: "#10B981", fontSize: "0.7rem", marginLeft: 4 }}>→N{comm.targetIndex}</span>
               )}
             </div>
           ))}
@@ -634,6 +641,12 @@ function parseCommunications(events, ideNode) {
       if (arrowMatch) dest = arrowMatch[1];
     }
 
+    // Pattern: "target=N2" or "target: N2"
+    if (!dest) {
+      const targetMatch = message.match(/target[\s:=]+([A-Za-z0-9_-]+)/i);
+      if (targetMatch) dest = targetMatch[1];
+    }
+
     // Pattern: "IDE Node", "peer N1"
     if (!dest) {
       const peerMatch = message.match(/peer\s+([A-Za-z0-9_-]+)/i)
@@ -648,6 +661,11 @@ function parseCommunications(events, ideNode) {
     const epoch = epochMatch ? epochMatch[1] : null;
     const samplesMatch = message.match(/rows=([0-9]+)/i) || message.match(/samples=([0-9]+)/i);
     const samples = samplesMatch ? samplesMatch[1] : null;
+    // Extract paramIndex and targetIndex from gradient logs
+    const paramMatch = message.match(/param\[(\d+)\]/i);
+    const paramIndex = paramMatch ? paramMatch[1] : null;
+    const targetMatch = message.match(/target=N(\d+)/i);
+    const targetIndex = targetMatch ? targetMatch[1] : null;
 
     const time = evt?.timestamp
       ? new Date(evt.timestamp).toLocaleTimeString("en-GB")
@@ -666,6 +684,8 @@ function parseCommunications(events, ideNode) {
       commType: detectType(message),
       epoch,
       samples,
+      paramIndex,
+      targetIndex,
       summary: message.length > 80 ? message.slice(0, 80) + "…" : message,
     });
   }
@@ -1255,6 +1275,8 @@ export default function App() {
                 eventCount={(filteredEvents || []).length}
                 connected={connected}
               />
+
+              <LearningStepIndicator events={filteredEvents} />
 
               <div
                 style={{

@@ -9,11 +9,12 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
     );
   }
 
-  const width = 520;
-  const height = 260;
+  // Increase SVG size for better visibility
+const width = 720;
+const height = 380;
   const centerX = width / 2;
   const centerY = height / 2;
-  const radius = Math.min(width, height) / 2 - 40;
+  const radius = Math.min(width, height) / 2 - 60;
 
   const positions = nodes.map((node, idx) => {
     const angle = (2 * Math.PI * idx) / nodes.length - Math.PI / 2;
