@@ -1,12 +1,13 @@
-import React, { useCallback, useMemo, useEffect, useState } from "react";
+import React, { useCallback, useMemo, useEffect, useState, useRef } from "react";
 import useWebSocket from "./hooks/useWebSocket";
+import { useDelayedState } from "./hooks/useDelayedState";
 import LaunchForm from "./components/LaunchForm";
 import EventFeed from "./components/EventFeed";
 import AccuracyChart from "./components/AccuracyChart";
 import NetworkTraceGraph from "./components/NetworkTraceGraph";
 import ParamHeatmap from "./components/ParamHeatmap";
 
-function Sidebar({ onStart, onStop, onClear }) {
+function Sidebar({ onStart, onStop, onClear, globalDelay, setGlobalDelay, isPaused, setIsPaused, eventFilters, setEventFilters }) {
   return (
     <aside
       style={{
@@ -31,6 +32,24 @@ function Sidebar({ onStart, onStop, onClear }) {
       <div style={{ padding: "16px", overflowY: "auto" }}>
         <div style={{ backgroundColor: "#111827", padding: 12, borderRadius: 10 }}>
           <LaunchForm onStart={onStart} onStop={onStop} onClear={onClear} />
+        </div>
+        {/* Controls for event stream */}
+        <div style={{ marginTop: 12, backgroundColor: "#111827", padding: 12, borderRadius: 8 }}>
+          <div style={{ marginBottom: 8, fontSize: "0.85rem", fontWeight: 600 }}>Event Stream Settings</div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <input type="range" min="10" max="150" step="10" value={globalDelay} onChange={e => setGlobalDelay(Number(e.target.value))} />
+            <span>{globalDelay} ms</span>
+          </label>
+          <button onClick={() => setIsPaused(!isPaused)} style={{ backgroundColor: isPaused ? "#EF4444" : "#10B981", border: "none", color: "#fff", padding: "6px 12px", borderRadius: 4 }}>
+            {isPaused ? "Play" : "Pause"}
+          </button>
+          <div style={{ marginTop: 8, fontSize: "0.75rem" }}>Filters:</div>
+          {Object.entries(eventFilters).map(([key, val]) => (
+            <label key={key} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <input type="checkbox" checked={val} onChange={e => setEventFilters(prev => ({...prev, [key]: e.target.checked }))} />
+              {key.charAt(0).toUpperCase() + key.slice(1)}
+            </label>
+          ))}
         </div>
       </div>
       <div style={{ padding: "16px", marginTop: "auto", borderTop: "1px solid rgba(255,255,255,0.1)", fontSize: "0.75rem", color: "rgba(255,255,255,0.5)" }}>
@@ -522,6 +541,23 @@ function isLearningCommunication(message) {
   return /epoch|accuracy|loss|dataset|batch|gradient|weights|param|model|learning|fedavg|global|local|ide node|élu|election|élection|leader|coordinator|aggregat/i.test(message);
 }
 
+function getEventCategory(event) {
+  const message = event?.message || '';
+  if (/chord|finger|stabilize|notify|successor|predecessor|route|dht|join|leave|lookup|replication|stabilisation|réparation/i.test(message)) {
+    return 'network';
+  }
+  if (/session|IDE élu|election|élection|leader|coordinator|requête/i.test(message)) {
+    return 'session';
+  }
+  if (/batch|dht|stockage|récupération|publication|dépôt/i.test(message)) {
+    return 'dht';
+  }
+  if (/epoch|accuracy|loss|learning|training|gradient|agrégation|fedavg|convergence|vote|entraînement|époque/i.test(message)) {
+    return 'learning';
+  }
+  return 'other';
+}
+
 function parseNetworkStats(events) {
   let activeNodes = 0;
   let nodes = [];
@@ -559,6 +595,10 @@ function parseCommunications(events, ideNode) {
     { type: "VOTE", re: /vote|convergence|accuracy/i },
     { type: "EPOCH", re: /epoch|f[ée]d[ée]r[ée]|global/i },
     { type: "ELECTION", re: /ide node|élu|election|élection|leader|coordinator/i },
+    { type: "DHT_PUT", re: /ChordProtocol\.put|PUT \[gradient\]/i },
+    { type: "DHT_GET", re: /ChordProtocol\.get|GET \[gradient\]/i },
+    { type: "DHT_LOOKUP", re: /ChordProtocol\.lookup|Lookup/i },
+    { type: "AGGREGATION", re: /aggregation triggered|aggregate\(\)/i },
   ];
 
   const detectType = (message) => {
@@ -572,7 +612,7 @@ function parseCommunications(events, ideNode) {
     const message = evt?.message;
     if (!message || typeof message !== "string") continue;
     if (evt?.type && evt.type !== "SIM_LOG") continue;
-    if (!isLearningCommunication(message)) continue;
+
 
     // Extraire le nœud source
     const nodeMatch = message.match(/\[Node\s+(\S+)\]/)
@@ -612,6 +652,11 @@ function parseCommunications(events, ideNode) {
     const time = evt?.timestamp
       ? new Date(evt.timestamp).toLocaleTimeString("en-GB")
       : "--:--:--";
+
+    // Exclure les logs de maintenance du finger Chord
+    if (message && /finger\[/i.test(message)) {
+      continue;
+    }
 
     communications.push({
       id: `${evt.timestamp || "no-ts"}-${source}-${dest}-${message.slice(0, 40)}`,
@@ -801,7 +846,7 @@ function parseSessionAccuracy(events) {
 }
 
 export default function App() {
-  const { events, connected } = useWebSocket(
+  const { events: rawEvents, connected } = useWebSocket(
     "ws://localhost:8080/ws",
     "http://localhost:8080/api/simulations/events?limit=2000"
   );
@@ -812,6 +857,14 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [summaryHistory, setSummaryHistory] = useState([]);
   const [learningHistory, setLearningHistory] = useState([]);
+  const [globalDelay, setGlobalDelay] = useState(800);
+  const [isPaused, setIsPaused] = useState(false);
+  const [eventFilters, setEventFilters] = useState({
+    network: true,
+    learning: true,
+    session: true,
+    dht: true,
+  });
 
   const handleStart = useCallback(async (payload) => {
     try {
@@ -883,13 +936,131 @@ export default function App() {
 
   const handleRefresh = () => setClearTick(0);
 
+  // === ARCHITECTURE BUFFER + AFFICHAGE PROGRESSIF ===
+  const eventBufferRef = useRef([]);
+  const [displayedEvents, setDisplayedEvents] = useState([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [bufferLen, setBufferLen] = useState(0);
+  const timeoutRef = useRef(null);
+  const seenEventsRef = useRef(new Set());
+
+  // 1. Buffer : stocke les événements reçus, filtre les logs Chord (finger)
+  useEffect(() => {
+    const newEvents = [];
+    for (const ev of rawEvents) {
+      const id = `${ev.timestamp}-${ev.message}`;
+      if (seenEventsRef.current.has(id)) continue;
+      seenEventsRef.current.add(id);
+
+      // Filtre définitif : supprime les logs de maintenance Chord (finger, successorList, succ/pred, lookup)
+      const msg = ev?.message;
+      if (msg && typeof msg === 'string') {
+        const lower = msg.toLowerCase();
+        // finger table logs
+        if (/finger\[/i.test(lower) || /fingers:/i.test(lower)) {
+          continue;
+        }
+        // successor list logs
+        if (/successorlist:\s*\[.*\]/i.test(lower)) {
+          continue;
+        }
+        // succ/pred logs
+        if (/->\s*succ:\s*n\d+\s*pred:\s*n\d+/i.test(lower)) {
+          continue;
+        }
+        // lookup logs (non‑learning related)
+        if (/lookup for id \d+ -> node n\d+/i.test(lower)) {
+          continue;
+        }
+        // generic Node N... (PeerSim=...) successor or succ/pred patterns
+        if (/node n\d+ \(peersim=\d+\)\s*(successorlist|-> succ)/i.test(lower)) {
+          continue;
+        }
+      }
+
+      newEvents.push(ev);
+    }
+    if (newEvents.length > 0) {
+      eventBufferRef.current = [...eventBufferRef.current, ...newEvents];
+      setBufferLen(eventBufferRef.current.length);
+    }
+  }, [rawEvents]);
+
+  // 2. Consommation progressive avec setInterval
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    if (isPaused) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
+
+    if (currentIndex >= bufferLen) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
+
+    intervalRef.current = setInterval(() => {
+      setCurrentIndex(prev => {
+        const nextIdx = prev + 1;
+        if (nextIdx <= eventBufferRef.current.length) {
+          setDisplayedEvents(eventBufferRef.current.slice(0, nextIdx));
+          return nextIdx;
+        }
+        return prev;
+      });
+    }, globalDelay);
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [isPaused, globalDelay, bufferLen]);
+
+  // Reset : réinitialise l'affichage
+  const handleReset = useCallback(() => {
+    setDisplayedEvents([]);
+    setCurrentIndex(0);
+    eventBufferRef.current = [];
+    seenEventsRef.current.clear();
+    setBufferLen(0);
+  }, []);
+
+  // Seek : navigation manuelle dans l'historique
+  const handleSeek = useCallback((newIndex) => {
+    const buffer = eventBufferRef.current;
+    const idx = Math.max(0, Math.min(newIndex, buffer.length));
+    setCurrentIndex(idx);
+    setDisplayedEvents(buffer.slice(0, idx));
+  }, []);
+
+  // Filtrage selon clearTick (reset temporel) + suppression définitive des logs Chord (finger)
   const filteredEvents = useMemo(() => {
-    if (!clearTick) return events;
-    return (events || []).filter((evt) => {
-      if (!evt?.timestamp) return false;
-      return new Date(evt.timestamp).getTime() > clearTick;
+    let events = displayedEvents || [];
+    if (clearTick) {
+      events = events.filter((evt) => {
+        if (!evt?.timestamp) return false;
+        return new Date(evt.timestamp).getTime() > clearTick;
+      });
+    }
+    // Filtre de sécurité : supprime définitivement les logs de maintenance Chord
+    events = events.filter((evt) => {
+      const msg = evt?.message;
+      if (msg && typeof msg === 'string' && (/finger\[/i.test(msg) || /fingers:/i.test(msg))) {
+        return false;
+      }
+      return true;
     });
-  }, [events, clearTick]);
+    return events;
+  }, [displayedEvents, clearTick]);
 
   const accuracyPoints = useMemo(() => parseAccuracy(filteredEvents), [filteredEvents]);
   const paramEvolution = useMemo(() => parseParamEvolution(filteredEvents), [filteredEvents]);
@@ -944,12 +1115,12 @@ export default function App() {
   }, [sessionsSummary]);
 
   useEffect(() => {
-    if (!events || events.length === 0) return;
+    if (!filteredEvents || filteredEvents.length === 0) return;
     setLearningHistory((prev) => {
       const merged = new Map();
       for (const item of prev) merged.set(item.id, item);
 
-      for (const evt of events) {
+      for (const evt of filteredEvents) {
         const message = evt?.message;
         if (!message || typeof message !== "string") continue;
         if (evt?.type && evt.type !== "SIM_LOG") continue;
@@ -985,14 +1156,14 @@ export default function App() {
 
       return Array.from(merged.values()).sort((a, b) => (b.startedAtMs || 0) - (a.startedAtMs || 0));
     });
-  }, [events]);
+  }, [filteredEvents]);
 
-  const [lastNetworkStats, setLastNetworkStats] = useState(networkStats);
-  const [lastSessionStats, setLastSessionStats] = useState(sessionStats);
-  const [lastAccuracyPoints, setLastAccuracyPoints] = useState(accuracyPoints);
-  const [lastCommunications, setLastCommunications] = useState([]);
-  const [lastLearningEvents, setLastLearningEvents] = useState([]);
-  const [lastParamEvolution, setLastParamEvolution] = useState({ epochs: [], params: [], values: new Map() });
+  const [lastNetworkStats, setLastNetworkStats] = useDelayedState(networkStats, globalDelay, isPaused);
+  const [lastSessionStats, setLastSessionStats] = useDelayedState(sessionStats, globalDelay, isPaused);
+  const [lastAccuracyPoints, setLastAccuracyPoints] = useDelayedState(accuracyPoints, globalDelay, isPaused);
+  const [lastCommunications, setLastCommunications] = useDelayedState([], globalDelay, isPaused);
+  const [lastLearningEvents, setLastLearningEvents] = useDelayedState([], globalDelay, isPaused);
+  const [lastParamEvolution, setLastParamEvolution] = useDelayedState({ epochs: [], params: [], values: new Map() }, globalDelay, isPaused);
 
   useEffect(() => {
     if (networkStats.nodes.length > 0 || networkStats.activeNodes > 0) {
@@ -1041,7 +1212,7 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", minHeight: "100vh", fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", backgroundColor: "#F3F4F6" }}>
-      <Sidebar onStart={handleStart} onStop={handleStop} onClear={handleClear} />
+      <Sidebar onStart={handleStart} onStop={handleStop} onClear={handleClear} globalDelay={globalDelay} setGlobalDelay={setGlobalDelay} isPaused={isPaused} setIsPaused={setIsPaused} eventFilters={eventFilters} setEventFilters={setEventFilters} />
       <div style={{ flex: 1, marginLeft: 320, minWidth: 0 }}>
         <Header connected={connected} onRefresh={handleRefresh} />
         <main style={{ padding: "24px", maxWidth: 1400, margin: "0 auto", width: "100%" }}>
@@ -1118,7 +1289,7 @@ export default function App() {
                   />
                 </Card>
                 <Card style={{ gridColumn: "span 2", minWidth: 380 }}>
-                  <EventFeed events={lastLearningEvents} />
+                  <EventFeed events={filteredEvents} filters={eventFilters} />
                 </Card>
               </div>
             </>

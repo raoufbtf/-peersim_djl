@@ -46,20 +46,31 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
     <svg width={width} height={height} style={{ display: "block", margin: "0 auto" }}>
       <rect x="8" y="8" width={width - 16} height={height - 16} rx="12" fill="#ffffff" stroke="#e5e7eb" />
 
-      {ideNode &&
-        positions
-          .filter((p) => p.node !== ideNode)
-          .map((p) => (
-            <line
-              key={`base-${p.node}`}
-              x1={getPosition(ideNode)?.x}
-              y1={getPosition(ideNode)?.y}
-              x2={p.x}
-              y2={p.y}
-              stroke="#e5e7eb"
-              strokeWidth={2}
-            />
-          ))}
+      {/* Ring representation of the DHT overlay */}
+      <circle
+        cx={centerX}
+        cy={centerY}
+        r={radius}
+        fill="none"
+        stroke="#e5e7eb"
+        strokeWidth={1}
+        strokeDasharray="4 4"
+      />
+      {/* Optional: draw connections between consecutive nodes to emphasize the ring */}
+      {positions.length > 1 && positions.map((p, idx) => {
+        const next = positions[(idx + 1) % positions.length];
+        return (
+          <line
+            key={`ring-${p.node}`}
+            x1={p.x}
+            y1={p.y}
+            x2={next.x}
+            y2={next.y}
+            stroke="#e5e7eb"
+            strokeWidth={1}
+          />
+        );
+      })}
       <defs>
         <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
           <feGaussianBlur stdDeviation="3" result="coloredBlur" />
@@ -85,7 +96,14 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
         const src = getPosition(comm.source);
         const dst = getPosition(comm.dest);
         if (!src || !dst) return null;
-        const stroke = comm.dest === ideNode ? "#dc2626" : "#16a34a";
+        let stroke = "#16a34a"; // default
+        if (comm.commType && comm.commType.startsWith("DHT_")) {
+          stroke = "#3b82f6"; // blue for DHT put/get/lookup
+        } else if (comm.commType === "AGGREGATION") {
+          stroke = "#f59e0b"; // orange for aggregation
+        } else if (comm.dest === ideNode) {
+          stroke = "#10b981"; // green for direct IDE communications
+        }
         return (
           <line
             key={`link-${comm.id || idx}`}
@@ -124,16 +142,16 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
         let fill = "#f3f4f6";
         let stroke = "#6b7280";
         let radius = 12;
+        let strokeWidth = 2;
         let filter = undefined;
         if (p.node === ideNode) {
           fill = "#b91c1c";
           stroke = "#7f1d1d";
-          radius = 16;
+          strokeWidth = 4; // thicker border to highlight IDE without larger radius
           filter = "url(#glow)";
         } else if (sessionSet.has(p.node)) {
           fill = "#22c55e";
           stroke = "#15803d";
-          radius = 12;
         }
         return (
           <circle
@@ -143,7 +161,7 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
             r={radius}
             fill={fill}
             stroke={stroke}
-            strokeWidth={2}
+            strokeWidth={strokeWidth}
             filter={filter}
           />
         );
@@ -163,13 +181,17 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
       ))}
 
       <g transform="translate(16, 18)">
-        <rect width="150" height="62" rx="8" fill="#f9fafb" stroke="#e5e7eb" />
+        <rect width="150" height="96" rx="8" fill="#f9fafb" stroke="#e5e7eb" />
         <circle cx="12" cy="16" r="7" fill="#b91c1c" />
-        <text x="24" y="20" fontSize="11" fill="#111827">IDE</text>
+        <text x="24" y="20" fontSize="11" fill="#111827">IDE (node)</text>
         <circle cx="12" cy="34" r="6" fill="#22c55e" />
         <text x="24" y="38" fontSize="11" fill="#111827">Learner</text>
-        <circle cx="12" cy="52" r="6" fill="#f3f4f6" stroke="#6b7280" />
-        <text x="24" y="56" fontSize="11" fill="#111827">Other</text>
+        <circle cx="12" cy="50" r="6" fill="#3b82f6" />
+        <text x="24" y="54" fontSize="11" fill="#111827">DHT (put/get)</text>
+        <circle cx="12" cy="66" r="6" fill="#f59e0b" />
+        <text x="24" y="70" fontSize="11" fill="#111827">Aggregation</text>
+        <circle cx="12" cy="82" r="6" fill="#10b981" />
+        <text x="24" y="86" fontSize="11" fill="#111827">IDE Direct</text>
       </g>
     </svg>
   );

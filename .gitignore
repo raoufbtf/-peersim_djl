@@ -2,3 +2,5 @@ target/
 node_modules/
 *.log
 *.class
+upload/
+graphify-out/
