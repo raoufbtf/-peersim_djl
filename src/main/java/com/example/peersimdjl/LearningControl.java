@@ -49,10 +49,16 @@ public class LearningControl implements Control {
         private final java.util.Map<String, float[]> localWeightsByNodeId = new java.util.LinkedHashMap<>();
         private final java.util.Map<String, Integer> datasetSizeByNodeId = new java.util.LinkedHashMap<>();
         private final java.util.Map<String, LocalModelManager> modelsByNodeId = new java.util.LinkedHashMap<>();
-        private float[] previousGlobalModel = null;
         private float[] currentGlobalModel = null;
         private int federatedEpoch = 0;
         private boolean convergenceReached = false;
+        private int stableEpochs = 0;
+        private double previousGlobalLoss = Double.NaN;
+        private double bestGlobalLoss = Double.POSITIVE_INFINITY;
+        private int bestGlobalEpoch = -1;
+        private float[] bestGlobalModel = null;
+        private long runStartedAtMs = System.currentTimeMillis();
+        private int noImprovementEpochs = 0;
         private float learningRate = 0.05f;
         private AccuracyTracker accuracyTracker = new AccuracyTracker();
 
@@ -111,6 +117,24 @@ public class LearningControl implements Control {
     private boolean learningRunsInitialized = false;
     private final SessionQueueManager sessionQueueManager = SessionQueueManager.getInstance();
     private final java.util.List<Integer> sessionNodeRequirements;
+    private final com.peersim.gossip.ConvergenceTracker convergenceTracker = new com.peersim.gossip.ConvergenceTrackerImpl("LearningControl");
+    private final java.util.concurrent.ExecutorService convergenceExecutor = java.util.concurrent.Executors.newFixedThreadPool(2);
+    private final java.util.concurrent.ScheduledExecutorService convergenceTimeoutScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+    private final java.util.concurrent.atomic.AtomicInteger convergenceVoteCount = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final java.util.concurrent.atomic.AtomicBoolean convergenceTimeoutScheduled = new java.util.concurrent.atomic.AtomicBoolean(false);
+    // Flag to ensure JVM exit is triggered only once when all runs complete
+    private volatile boolean exitTriggered = false;
+    private static final float LOSS_STOP_THRESHOLD = 0.1f;
+    private static final float PARAMETER_STABILITY_EPSILON = 1.0e-6f;
+    private static final int DEFAULT_FEDERATED_EPOCHS = 20;
+    private static final int DEFAULT_PATIENCE_EPOCHS = 4;
+    private static final int DEFAULT_MAX_TRAINING_MILLIS = 600_000;
+    private final int patienceEpochs;
+    private final int maxTrainingMillis;
+
+    private static double round3(double loss) {
+        return Math.floor(loss * 1000.0d) / 1000.0d;
+    }
 
     /**
      * Construit le contrôleur d'apprentissage depuis la configuration PeerSim.
@@ -130,7 +154,7 @@ public class LearningControl implements Control {
         this.configuredDatasetPaths = parsedDatasetPaths;
         this.maxBatchesPerNode = Math.max(1,
                 Configuration.getInt(prefix + ".maxBatchesPerNode", DEFAULT_MAX_BATCHES_PER_NODE));
-        this.federatedEpochLimit = Math.max(1, Configuration.getInt(prefix + ".federatedEpochs", 3));
+        this.federatedEpochLimit = Math.max(1, Configuration.getInt(prefix + ".federatedEpochs", DEFAULT_FEDERATED_EPOCHS));
         this.initialLearningRate = (float) Math.max(0.0001d,
             Configuration.getDouble(prefix + ".learningRate", 0.05d));
         this.configuredNumParams = Math.max(1, Configuration.getInt(prefix + ".numParams", 4));
@@ -138,6 +162,8 @@ public class LearningControl implements Control {
         this.preprocessOnUpload = Configuration.getBoolean(prefix + ".preprocessOnUpload", true);
         this.learningSessionCount = Math.max(1, Configuration.getInt(prefix + ".sessionCount", 1));
         this.sessionNodeRequirements = parseNodeRequirements(Configuration.getString(prefix + ".sessionRequirements", ""));
+        this.patienceEpochs = Math.max(1, Configuration.getInt(prefix + ".patienceEpochs", DEFAULT_PATIENCE_EPOCHS));
+        this.maxTrainingMillis = Math.max(30_000, Configuration.getInt(prefix + ".maxTrainingMillis", DEFAULT_MAX_TRAINING_MILLIS));
         String strategyName = Configuration.getString(prefix + ".batchStrategy", "ROUND_ROBIN");
         BatchAssignmentStrategy parsedStrategy;
         try {
@@ -194,11 +220,67 @@ public class LearningControl implements Control {
             }
 
             if (run.runningTransitionDone && !run.completionDone) {
-                if (run.federatedEpoch >= federatedEpochLimit || run.convergenceReached) {
+                if (shouldStopTraining(run)) {
                     transitionSessionToDone(run);
                 } else {
                     executeFederatedEpoch(run);
                 }
+            }
+        }
+
+        // If all learning runs have completed, perform cleanup and exit the simulation JVM.
+        if (!exitTriggered && learningRunsInitialized && !learningRuns.isEmpty()) {
+            boolean allDone = true;
+            for (LearningRunState run : learningRuns) {
+                if (!run.completionDone) {
+                    allDone = false;
+                    break;
+                }
+            }
+
+            if (allDone) {
+                exitTriggered = true;
+                System.out.println("[LearningControl] ✅ All learning sessions completed — initiating clean shutdown of simulation JVM");
+
+                // Close local models and other resources per-run
+                try {
+                    for (LearningRunState run : learningRuns) {
+                        try {
+                            for (LocalModelManager mgr : run.modelsByNodeId.values()) {
+                                if (mgr != null) {
+                                    try {
+                                        mgr.close();
+                                    } catch (Exception ignore) {
+                                        // best-effort close
+                                    }
+                                }
+                            }
+                        } catch (Exception ignore) {
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+
+                // Shutdown internal executors used for convergence/gossip
+                try {
+                    convergenceExecutor.shutdownNow();
+                } catch (Exception ignored) {
+                }
+                try {
+                    convergenceTimeoutScheduler.shutdownNow();
+                } catch (Exception ignored) {
+                }
+
+                // Give a short grace period for background cleanup, then exit the JVM.
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(2000);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                    }
+                    System.out.println("[LearningControl] JVM exit() called to terminate PeerSim process");
+                    System.exit(0);
+                }, "learningcontrol-exit-trigger").start();
             }
         }
 
@@ -620,6 +702,17 @@ public class LearningControl implements Control {
                 System.out.println("[LearningControl] ✓ " + batch.batchId + " assigné à " + target.nodeIdString +
                         " (ChordId=" + target.nodeId + ", charge=" + run.nodeLoadById.get(target.nodeIdString) + "/" +
                         maxBatchesPerNode + ")");
+                SimulationCommEventLogger.emit(
+                        "BATCH",
+                        "LearningControl",
+                        target.nodeIdString,
+                        run.federatedEpoch,
+                        (int) peersim.core.CommonState.getTime(),
+                        batch.batchId,
+                        null,
+                        null,
+                        null,
+                        "batch distribution rows=" + (batch.data != null ? batch.data.length : 0));
             } else {
                 System.err.println("[LearningControl] ✗ Impossible de stocker " + batch.batchId + " dans le DHT");
             }
@@ -691,10 +784,18 @@ public class LearningControl implements Control {
      * Exécute une epoch FL complète sans thread, en 7 phases ordonnées.
      */
     private void executeFederatedEpoch(LearningRunState run) {
+        if (shouldStopTraining(run)) {
+            run.convergenceReached = true;
+            return;
+        }
+
         int epoch = run.federatedEpoch;
         java.util.List<String> nodeIds = collectParticipantNodeIds(run);
         int expectedContributors = nodeIds.size();
         int numParams = inferNumParams(run);
+        float[] previousGlobalModel = run.currentGlobalModel == null
+            ? null
+            : java.util.Arrays.copyOf(run.currentGlobalModel, run.currentGlobalModel.length);
 
         System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch START =====");
 
@@ -713,7 +814,8 @@ public class LearningControl implements Control {
         }
 
         for (ChordProtocol protocol : run.activeParticipants) {
-            new DepotAggregator(protocol).checkAndAggregate(epoch);
+            new DepotAggregator(protocol, run.currentSession != null ? run.currentSession.ideNodeIdString : "N0")
+                    .checkAndAggregate(epoch);
         }
 
         float[] globalModel = null;
@@ -730,33 +832,80 @@ public class LearningControl implements Control {
             return;
         }
 
-        run.previousGlobalModel = run.currentGlobalModel;
-        run.currentGlobalModel = java.util.Arrays.copyOf(globalModel, globalModel.length);
-
         int totalDatasetSize = sumDatasetSize(run);
         run.accuracyTracker.evaluateGlobal(globalModel, totalDatasetSize, epoch);
 
-        for (ChordProtocol protocol : run.activeParticipants) {
-            ConvergenceVoter voter = new ConvergenceVoter(protocol);
-            ConvergenceVoter.Vote vote;
-            if (run.previousGlobalModel == null) {
-                vote = ConvergenceVoter.Vote.CONTINUE;
-            } else {
-                vote = voter.computeVote(globalModel, run.previousGlobalModel);
-            }
-            voter.publishVote(vote, epoch, protocol.nodeIdString);
+        double globalLoss = run.accuracyTracker.getGlobalLoss(epoch);
+        double roundedCurrentLoss = round3(globalLoss);
+        double roundedPreviousLoss = round3(run.previousGlobalLoss);
+
+        if (Double.isFinite(globalLoss) && roundedCurrentLoss < round3(run.bestGlobalLoss)) {
+            run.bestGlobalLoss = globalLoss;
+            run.bestGlobalEpoch = epoch;
+            run.bestGlobalModel = java.util.Arrays.copyOf(globalModel, globalModel.length);
+            run.noImprovementEpochs = 0;
+            System.out.println("[EPOCH " + epoch + "] new best loss="
+                    + String.format(java.util.Locale.ROOT, "%.3f", globalLoss)
+                    + " (bestEpoch=" + run.bestGlobalEpoch + ")");
+        } else {
+            run.noImprovementEpochs++;
         }
 
-        VoteCollector.Decision decision = new VoteCollector(run.activeParticipants.get(0))
-                .collectAndDecide(epoch, nodeIds);
-
-        if (decision == VoteCollector.Decision.RESET_LR) {
-            run.learningRate = Math.max(0.0001f, run.learningRate * 0.5f);
-            System.out.println("[EPOCH " + epoch + "] divergence détectée -> learningRate=" + run.learningRate);
-        } else if (decision == VoteCollector.Decision.STOP_CONVERGED) {
+        double parameterDelta = computeMaxAbsDelta(previousGlobalModel, globalModel);
+        boolean stableParameters = !Double.isNaN(parameterDelta)
+                && parameterDelta <= PARAMETER_STABILITY_EPSILON;
+        if (stableParameters) {
+            run.stableEpochs++;
             run.convergenceReached = true;
-            System.out.println("[EPOCH " + epoch + "] quorum convergent atteint.");
-            compareGlobalModelOnLocalBatches(run, epoch);
+            System.out.println("[EPOCH " + epoch + "] parameter stability reached -> stop (maxDelta="
+                + String.format(java.util.Locale.ROOT, "%.6f", parameterDelta)
+                    + ", stableEpochs=" + run.stableEpochs + ")");
+        } else {
+            run.stableEpochs = 0;
+        }
+
+        run.currentGlobalModel = java.util.Arrays.copyOf(globalModel, globalModel.length);
+        SimulationCommEventLogger.emit(
+            "GLOBAL_MODEL",
+            run.currentSession != null ? run.currentSession.ideNodeIdString : "N0",
+            "ALL",
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "global",
+            null,
+            null,
+            null,
+            "global model updated");
+
+        boolean plateauConverged = !Double.isNaN(globalLoss) && run.noImprovementEpochs >= patienceEpochs;
+        boolean thresholdConverged = !Double.isNaN(globalLoss) && roundedCurrentLoss <= LOSS_STOP_THRESHOLD;
+
+        if (plateauConverged) {
+            run.convergenceReached = true;
+            System.out.println("[EPOCH " + epoch + "] plateau reached -> stop (noImprovementEpochs="
+                    + run.noImprovementEpochs + ", patience=" + patienceEpochs + ", bestLoss="
+                    + String.format(java.util.Locale.ROOT, "%.3f", run.bestGlobalLoss) + ")");
+        } else if (thresholdConverged) {
+            run.convergenceReached = true;
+            System.out.println("[EPOCH " + epoch + "] loss threshold reached -> stop (current="
+                + String.format(java.util.Locale.ROOT, "%.3f", globalLoss)
+                + ", previous=" + String.format(java.util.Locale.ROOT, "%.3f", run.previousGlobalLoss)
+                + ", roundedCurrent=" + String.format(java.util.Locale.ROOT, "%.3f", roundedCurrentLoss)
+                + ", roundedPrevious=" + String.format(java.util.Locale.ROOT, "%.3f", roundedPreviousLoss)
+                + ")");
+        }
+
+        if (isTrainingTimeExceeded(run)) {
+            run.convergenceReached = true;
+            System.out.println("[EPOCH " + epoch + "] max training time reached -> stop (elapsedMs="
+                    + (System.currentTimeMillis() - run.runStartedAtMs)
+                    + ", maxTrainingMillis=" + maxTrainingMillis + ")");
+        }
+
+        run.previousGlobalLoss = globalLoss;
+
+        for (ChordProtocol protocol : run.activeParticipants) {
+            gossipConvergence(protocol.nodeIdString, nodeIds, epoch);
         }
 
         for (String nodeId : nodeIds) {
@@ -771,50 +920,42 @@ public class LearningControl implements Control {
         run.federatedEpoch++;
     }
 
-    private void compareGlobalModelOnLocalBatches(LearningRunState run, int epoch) {
-        if (run.currentGlobalModel == null || run.currentGlobalModel.length == 0) {
-            System.out.println("[EPOCH " + epoch + "] Comparaison globale ignorée: modèle global vide");
-            return;
+    private double computeMaxAbsDelta(float[] previousModel, float[] currentModel) {
+        if (previousModel == null || currentModel == null) {
+            return Double.NaN;
+        }
+        if (previousModel.length != currentModel.length || previousModel.length == 0) {
+            return Double.NaN;
         }
 
-        System.out.println("[EPOCH " + epoch + "] ===== Compare global vs local on batches =====");
-        for (DataBatch batch : run.distributedBatches) {
-            if (batch == null || batch.data == null || batch.data.length == 0) {
-                continue;
-            }
-
-            String nodeId = batch.assignedNodeIdString != null ? batch.assignedNodeIdString : batch.processingNodeIdString;
-            if (nodeId == null) {
-                nodeId = "unknown";
-            }
-
-            LocalModelManager model = run.modelsByNodeId.get(nodeId);
-            if (model == null) {
-                System.out.println("[EPOCH " + epoch + "][COMPARE] batch=" + batch.batchId + " node=" + nodeId
-                        + " local model unavailable");
-                continue;
-            }
-
-            float[] localWeights = model.getModelWeights();
-            if (localWeights == null) {
-                localWeights = new float[0];
-            }
-
-            try {
-                model.setModelWeights(run.currentGlobalModel);
-                float globalAccuracy = model.evaluateAccuracy(batch.data);
-
-                model.setModelWeights(localWeights);
-                float localAccuracy = model.evaluateAccuracy(batch.data);
-
-                float delta = globalAccuracy - localAccuracy;
-                System.out.printf("[EPOCH %d][COMPARE] batch=%s node=%s rows=%d localAcc=%.4f globalAcc=%.4f delta=%.4f%n",
-                        epoch, batch.batchId, nodeId, batch.rowCount(), localAccuracy, globalAccuracy, delta);
-            } finally {
-                model.setModelWeights(localWeights);
+        double maxDelta = 0.0d;
+        for (int i = 0; i < previousModel.length; i++) {
+            double delta = Math.abs(previousModel[i] - currentModel[i]);
+            if (delta > maxDelta) {
+                maxDelta = delta;
             }
         }
-        System.out.println("[EPOCH " + epoch + "] ===== End compare global vs local =====");
+        return maxDelta;
+    }
+
+    private boolean shouldStopTraining(LearningRunState run) {
+        if (run == null) {
+            return true;
+        }
+
+        if (run.federatedEpoch >= federatedEpochLimit) {
+            return true;
+        }
+
+        if (run.convergenceReached) {
+            return true;
+        }
+
+        return isTrainingTimeExceeded(run);
+    }
+
+    private boolean isTrainingTimeExceeded(LearningRunState run) {
+        return run != null && System.currentTimeMillis() - run.runStartedAtMs >= maxTrainingMillis;
     }
 
     private java.util.List<String> collectParticipantNodeIds(LearningRunState run) {
@@ -904,12 +1045,12 @@ public class LearningControl implements Control {
         int localEpochs = Math.min(3, Math.max(1, datasetSize / 50));
         float loss = model.trainLocalModel(localData, localEpochs);
         System.out.println("[LearningControl] [" + nodeId + "] Epoch " + epoch + 
-                         " Training Loss: " + String.format("%.6f", loss) + 
+                         " Training Loss: " + String.format("%.3f", loss) + 
                          " on " + localData.length + " samples");
         
         // Évaluer la précision locale
         float accuracy = model.evaluateLocal(localData);
-        run.accuracyTracker.trackLocalAccuracy(nodeId, accuracy, epoch);
+        run.accuracyTracker.trackLocalMetrics(nodeId, accuracy, loss, epoch);
         
         // Retourner les nouveaux poids du modèle
         return model.getModelWeights();
@@ -988,6 +1129,17 @@ public class LearningControl implements Control {
         if (updated) {
             System.out.println("[LearningControl] ✓ Session est maintenant en état RUNNING");
             System.out.println("[LearningControl]   " + session);
+            SimulationCommEventLogger.emit(
+                    "STATE",
+                    "LearningControl",
+                    session.ideNodeIdString,
+                    run.federatedEpoch,
+                    (int) peersim.core.CommonState.getTime(),
+                    null,
+                    null,
+                    null,
+                    null,
+                    "session " + session.sessionId + " -> RUNNING");
             run.runningTransitionDone = true;
         } else {
             System.err.println("[LearningControl] ✗ Erreur lors de la transition RUNNING");
@@ -1016,6 +1168,15 @@ public class LearningControl implements Control {
         boolean updated = dhtManager.storeSessionInDHT(session);
         
         if (updated) {
+            if (run.bestGlobalModel != null && run.bestGlobalModel.length > 0) {
+                run.currentGlobalModel = java.util.Arrays.copyOf(run.bestGlobalModel, run.bestGlobalModel.length);
+                for (String nodeId : new java.util.ArrayList<>(run.localWeightsByNodeId.keySet())) {
+                    run.localWeightsByNodeId.put(nodeId, java.util.Arrays.copyOf(run.bestGlobalModel, run.bestGlobalModel.length));
+                }
+                System.out.println("[LearningControl] ✓ Best model restored (epoch=" + run.bestGlobalEpoch
+                        + ", loss=" + String.format(java.util.Locale.ROOT, "%.3f", run.bestGlobalLoss) + ")");
+            }
+
             System.out.println("[LearningControl] ✓ Session est maintenant DONE");
             System.out.println("[LearningControl]   " + session);
 
@@ -1033,9 +1194,65 @@ public class LearningControl implements Control {
             System.out.println("[LearningControl] ✓ Nettoyage batchs physiques terminé : " + deletedCount + "/" + run.distributedBatches.size());
             sessionQueueManager.onSessionComplete(run.request.sessionId);
             System.out.println("[LearningControl] === Apprentissage distribué TERMINÉ ===");
+            SimulationCommEventLogger.emit(
+                    "STATE",
+                    "LearningControl",
+                    "Session",
+                    run.federatedEpoch,
+                    (int) peersim.core.CommonState.getTime(),
+                    null,
+                    null,
+                    null,
+                    null,
+                    "DONE");
             run.completionDone = true;
         } else {
             System.err.println("[LearningControl] ✗ Erreur lors de la transition DONE");
         }
+    }
+
+    @SuppressWarnings("unused")
+    private void gossipConvergence(String peerId, java.util.List<String> participants, int epoch) {
+        convergenceExecutor.execute(() -> {
+            convergenceTracker.recordVote(peerId);
+            int totalVotes = convergenceVoteCount.incrementAndGet();
+            int totalPeers = Math.max(1, activeNodeCount);
+            double threshold = 0.7d;
+
+            for (String target : participants) {
+                if (target == null || target.equals(peerId)) {
+                    continue;
+                }
+                SimulationCommEventLogger.emit(
+                        "GOSSIP_VOTE",
+                        peerId,
+                        target,
+                        epoch,
+                        (int) peersim.core.CommonState.getTime(),
+                        null,
+                        null,
+                        totalVotes + "/" + totalPeers,
+                        threshold,
+                        "convergence vote sent");
+            }
+
+            System.out.println("[VOTE_RECEIVED] from=" + peerId
+                    + " total=" + totalVotes + "/" + totalPeers
+                    + " threshold=" + threshold);
+
+            if (convergenceTracker.hasQuorum(totalPeers, threshold)) {
+                System.out.println("[GOSSIP] quorum convergence observed for " + peerId + " (no early stop, loss threshold controls termination)");
+                return;
+            }
+
+            if (convergenceTimeoutScheduled.compareAndSet(false, true)) {
+                convergenceTimeoutScheduler.schedule(() -> {
+                    if (!convergenceTracker.hasQuorum(Math.max(1, activeNodeCount), 0.7d)) {
+                        System.out.println("[GOSSIP] timeout reached without quorum; learning continues until loss <= "
+                                + LOSS_STOP_THRESHOLD);
+                    }
+                }, 30, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        });
     }
 }

@@ -1,4 +1,4 @@
-﻿import React from "react";
+import React from "react";
 
 const T = {
   surface: "#0d1526", card: "#111d35", border: "#1e2d4a",
@@ -8,42 +8,12 @@ const T = {
 };
 
 const COMM_COLORS = {
-  GRADIENT: T.cyan,
-  GOSSIP_VOTE: T.purple,
-  DEPOT: T.amber,
+  GRADIENT:     T.cyan,
+  GOSSIP_VOTE:  T.purple,
+  DEPOT:        T.amber,
   GLOBAL_MODEL: T.green,
-  STATE: T.red,
+  STATE:        T.red,
 };
-
-function normalizeEndpoint(value) {
-  if (value == null) return "";
-  return String(value).trim();
-}
-
-function normalizeCommunications(communications) {
-  return (communications || [])
-    .map((comm, index) => {
-      const source = normalizeEndpoint(comm.source || comm.from);
-      const dest = normalizeEndpoint(comm.dest || comm.to);
-      const commType = comm.commType || comm.type || "COMM";
-      const time = comm.time || comm.timestamp || "";
-      const id = comm.id || `${time}-${commType}-${source}-${dest}-${comm.epoch ?? ""}-${comm.cycle ?? ""}-${index}`;
-      return {
-        id,
-        time,
-        source,
-        dest,
-        commType,
-        epoch: comm.epoch,
-        cycle: comm.cycle,
-        detail: comm.detail || "",
-        value: comm.value,
-        param: comm.param,
-        voteCount: comm.voteCount,
-      };
-    })
-    .filter(comm => comm.source && comm.dest);
-}
 
 export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, communications, speed = 1 }) {
   if (!nodes || nodes.length === 0) {
@@ -55,26 +25,24 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
     );
   }
 
-  const W = 600;
-  const H = 290;
-  const cx = W / 2;
-  const cy = H / 2;
+  const W = 600, H = 290;
+  const cx = W / 2, cy = H / 2;
   const r = Math.min(W, H) / 2 - 44;
-  const safeSpeed = Number.isFinite(speed) && speed > 0 ? speed : 1;
   const sessionSet = new Set(sessionNodes || []);
-  const recentComms = normalizeCommunications(communications).slice(-40);
-  const animated = recentComms.slice(-12);
 
   const positions = nodes.map((node, idx) => {
     const angle = (2 * Math.PI * idx) / nodes.length - Math.PI / 2;
     return { node, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
   });
 
-  const getPos = (id) => positions.find(p => p.node === id);
+  const getPos = id => positions.find(p => p.node === id);
+
+  const recentComms = (communications || []).slice(-40);
+  const animated = recentComms.slice(-12);
 
   return (
     <div style={{ position: "relative" }}>
-      <svg key={`speed-${safeSpeed}`} width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
         <defs>
           <filter id="glow-red" x="-60%" y="-60%" width="220%" height="220%">
             <feGaussianBlur stdDeviation="4" result="blur" />
@@ -92,6 +60,7 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
           <marker id="arrow-default" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
             <path d="M 0 0 L 8 4 L 0 8 z" fill={T.textMuted} opacity="0.6" />
           </marker>
+
           <radialGradient id="bg-grad" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stopColor="#0a1628" />
             <stop offset="100%" stopColor="#070c18" />
@@ -106,46 +75,36 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
           const ide = getPos(ideNode);
           if (!ide) return null;
           return (
-            <line
-              key={`base-${p.node}`}
-              x1={ide.x} y1={ide.y} x2={p.x} y2={p.y}
-              stroke={T.border} strokeWidth={1} opacity={0.4}
-            />
+            <line key={`base-${p.node}`} x1={ide.x} y1={ide.y} x2={p.x} y2={p.y} stroke={T.border} strokeWidth={1} opacity={0.4} />
           );
         })}
 
         {recentComms.map((comm, i) => {
-          const src = getPos(comm.source);
-          const dst = getPos(comm.dest);
+          const src = getPos(comm.source || comm.from);
+          const dst = getPos(comm.dest || comm.to);
           if (!src || !dst || src === dst) return null;
-          const color = COMM_COLORS[comm.commType] || T.textSecondary;
-          const markerKey = COMM_COLORS[comm.commType] ? comm.commType : "default";
+          const color = COMM_COLORS[comm.commType || comm.type] || T.textSecondary;
+          const markerId = `arrow-${comm.commType || comm.type}`;
           return (
-            <line
-              key={`link-${comm.id || i}`}
-              x1={src.x} y1={src.y} x2={dst.x} y2={dst.y}
-              stroke={color} strokeWidth={1.5}
-              markerEnd={`url(#arrow-${markerKey})`}
-              opacity={0.55}
-            />
+            <line key={`link-${comm.id || i}`} x1={src.x} y1={src.y} x2={dst.x} y2={dst.y} stroke={color} strokeWidth={1.5} markerEnd={`url(#${markerId})`} opacity={0.55} />
           );
         })}
 
         {animated.map((comm, idx) => {
-          const src = getPos(comm.source);
-          const dst = getPos(comm.dest);
+          const src = getPos(comm.source || comm.from);
+          const dst = getPos(comm.dest || comm.to);
           if (!src || !dst || src === dst) return null;
           const path = `M ${src.x} ${src.y} L ${dst.x} ${dst.y}`;
-          const color = COMM_COLORS[comm.commType] || T.cyan;
+          const color = COMM_COLORS[comm.commType || comm.type] || T.cyan;
           const baseDur = 1.8 + (idx % 4) * 0.3;
           const baseDel = (idx * 0.12) % 2;
-          const dur = Math.max(0.08, baseDur / safeSpeed);
-          const del = baseDel / safeSpeed;
+          const dur = Math.max(0.05, baseDur / Math.max(0.01, speed));
+          const del = baseDel / Math.max(0.01, speed);
           return (
             <circle key={`pkt-${comm.id || idx}`} r={4} fill={color} opacity={0.9}>
               <animateMotion dur={`${dur}s`} repeatCount="indefinite" begin={`${del}s`} path={path} />
               <animate attributeName="opacity" values="0;1;1;0" dur={`${dur}s`} repeatCount="indefinite" begin={`${del}s`} />
-              <animate attributeName="r" values="3;5;3" dur={`${Math.max(0.05, dur * 0.6)}s`} repeatCount="indefinite" />
+              <animate attributeName="r" values="3;5;3" dur={`${dur * 0.6}s`} repeatCount="indefinite" />
             </circle>
           );
         })}
@@ -153,17 +112,12 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
         {positions.map(p => {
           const isIde = p.node === ideNode;
           const isSess = sessionSet.has(p.node);
-          const fill = isIde ? T.red : isSess ? T.green : "#1a2a45";
+          const fill   = isIde ? T.red     : isSess ? T.green   : "#1a2a45";
           const stroke = isIde ? "#ff6b6b" : isSess ? "#4aeea4" : T.border;
-          const nr = isIde ? 14 : isSess ? 11 : 8;
+          const nr     = isIde ? 14        : isSess ? 11        : 8;
           const filterId = isIde ? "url(#glow-red)" : isSess ? "url(#glow-green)" : undefined;
           return (
-            <circle
-              key={`node-${p.node}`}
-              cx={p.x} cy={p.y} r={nr}
-              fill={fill} stroke={stroke} strokeWidth={isIde ? 2.5 : 1.5}
-              filter={filterId}
-            />
+            <circle key={`node-${p.node}`} cx={p.x} cy={p.y} r={nr} fill={fill} stroke={stroke} strokeWidth={isIde ? 2.5 : 1.5} filter={filterId} />
           );
         })}
 
@@ -171,19 +125,12 @@ export default function NetworkTraceGraph({ nodes, ideNode, sessionNodes, commun
           const isIde = p.node === ideNode;
           const isSess = sessionSet.has(p.node);
           const color = isIde ? T.red : isSess ? T.green : T.textSecondary;
-          const dx = p.x - cx;
-          const dy = p.y - cy;
+          const dx = p.x - cx, dy = p.y - cy;
           const dist = Math.sqrt(dx * dx + dy * dy) || 1;
           const lx = p.x + (dx / dist) * 20;
           const ly = p.y + (dy / dist) * 20;
           return (
-            <text
-              key={`lbl-${p.node}`}
-              x={lx} y={ly}
-              textAnchor="middle" dominantBaseline="middle"
-              fontSize="9" fontFamily={T.fontMono} fontWeight={isIde ? 700 : 500}
-              fill={color}
-            >{p.node}</text>
+            <text key={`lbl-${p.node}`} x={lx} y={ly} textAnchor="middle" dominantBaseline="middle" fontSize="9" fontFamily={T.fontMono} fontWeight={isIde ? 700 : 500} fill={color}>{p.node}</text>
           );
         })}
 

@@ -101,7 +101,7 @@ public class LocalModelManager implements Serializable {
             trainingIterations++;
             if (DEBUG && epoch % Math.max(1, numEpochs/3) == 0) {
                 System.out.println(TAG + " [" + nodeId + "] Epoch " + epoch + "/" + numEpochs + 
-                                   " Loss: " + String.format("%.6f", finalLoss));
+                                   " Loss: " + String.format("%.3f", finalLoss));
             }
         }
 

@@ -8,9 +8,11 @@ import java.util.Map;
 public class DepotAggregator {
 
     private final ChordProtocol chord;
+    private final String ideNodeId;
 
-    public DepotAggregator(ChordProtocol chord) {
+    public DepotAggregator(ChordProtocol chord, String ideNodeId) {
         this.chord = chord;
+        this.ideNodeId = ideNodeId;
     }
 
     public void checkAndAggregate(int epoch) {
@@ -35,13 +37,30 @@ public class DepotAggregator {
             }
 
             float aggregatedValue = depot.aggregate();
-            chord.putLocal(key, depot);
-
             String globalKey = FederatedDhtKeys.globalKey(epoch, depot.getParamIndex());
-            chord.put(globalKey, aggregatedValue);
+
+            ChordProtocol ownerChord = ParameterShardRouter.ownerForParam(chord, depot.getParamIndex());
+            if (ownerChord == null) {
+                continue;
+            }
+
+            ownerChord.putLocal(key, depot);
+            ownerChord.putLocal(globalKey, aggregatedValue);
+
+                SimulationCommEventLogger.emit(
+                    "DEPOT",
+                    ownerChord.nodeIdString,
+                    ideNodeId,
+                    epoch,
+                    (int) peersim.core.CommonState.getTime(),
+                    "param[" + depot.getParamIndex() + "]",
+                    (double) aggregatedValue,
+                    null,
+                    null,
+                    "aggregated from " + depot.getContributions().keySet());
 
             System.out.println("[EPOCH " + epoch + "][Depot param[" + depot.getParamIndex() + "]][Node "
-                    + chord.nodeIdString + "] contributions=" + depot.getContributions().keySet()
+                    + ownerChord.nodeIdString + "] contributions=" + depot.getContributions().keySet()
                     + " -> global=" + aggregatedValue + " key=" + globalKey);
         }
     }

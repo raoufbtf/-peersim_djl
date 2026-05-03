@@ -1,1349 +1,1112 @@
 import React, { useCallback, useMemo, useEffect, useState, useRef } from "react";
 import useWebSocket from "./hooks/useWebSocket";
-import { useDelayedState } from "./hooks/useDelayedState";
 import LaunchForm from "./components/LaunchForm";
-import EventFeed from "./components/EventFeed";
 import AccuracyChart from "./components/AccuracyChart";
+import EventFeed from "./components/EventFeed";
 import NetworkTraceGraph from "./components/NetworkTraceGraph";
-import LearningStepIndicator from "./components/LearningStepIndicator";
 import ParamHeatmap from "./components/ParamHeatmap";
 
-function Sidebar({ onStart, onStop, onClear, globalDelay, setGlobalDelay, isPaused, setIsPaused, eventFilters, setEventFilters }) {
+/* ─── THEME ────────────────────────────────────────────── */
+const T = {
+  bg:       "#070c18",
+  surface:  "#0d1526",
+  card:     "#111d35",
+  border:   "#1e2d4a",
+  cyan:     "#00c8ff",
+  green:    "#10d98a",
+  amber:    "#f5a623",
+  red:      "#f43f5e",
+  purple:   "#a78bfa",
+  textPrimary:   "#e2eaf8",
+  textSecondary: "#6b82a8",
+  textMuted:     "#3d5070",
+  fontMono: "'JetBrains Mono', 'Fira Code', 'Courier New', monospace",
+  fontUI:   "'Inter', system-ui, sans-serif",
+};
+
+/* inject Google Font once */
+function useFonts() {
+  useEffect(() => {
+    const id = "peersim-fonts";
+    if (document.getElementById(id)) return;
+    const link = document.createElement("link");
+    link.id = id;
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap";
+    document.head.appendChild(link);
+    const style = document.createElement("style");
+    style.textContent = `
+      * { box-sizing: border-box; }
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-track { background: ${T.surface}; }
+      ::-webkit-scrollbar-thumb { background: ${T.border}; border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: #2e4470; }
+      @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.7)} }
+      @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+      @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+      @keyframes gradient-flow {
+        0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%}
+      }
+    `;
+    document.head.appendChild(style);
+  }, []);
+}
+
+/* ─── PARSERS ───────────────────────────────────────────── */
+function parseAccuracy(events) {
+  const sums = new Map();
+  const globalByEpoch = new Map();
+  for (const evt of events || []) {
+    /* structured ACCURACY events */
+    if (evt?.type === "ACCURACY" && evt.payload) {
+      const { epoch, localAccuracy, globalAccuracy } = evt.payload;
+      if (epoch != null) {
+        const e = sums.get(epoch) || { localSum: 0, globalSum: 0, count: 0 };
+        e.localSum += localAccuracy || 0;
+        e.globalSum += globalAccuracy || 0;
+        e.count += 1;
+        sums.set(epoch, e);
+        globalByEpoch.set(epoch, globalAccuracy);
+      }
+      continue;
+    }
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const globalMatch = msg.match(/\[EPOCH\s+(\d+)\]\[GLOBAL\]\s+real accuracy=([0-9.]+)/);
+    if (globalMatch) globalByEpoch.set(+globalMatch[1], +globalMatch[2]);
+    const localMatch = msg.match(/\[EPOCH\s+(\d+)\]\[Node\s+\S+\]\s+real accuracy=([0-9.]+)/);
+    if (localMatch) {
+      const ep = +localMatch[1], la = +localMatch[2];
+      const e = sums.get(ep) || { localSum: 0, globalSum: 0, count: 0 };
+      e.localSum += la; e.count += 1;
+      sums.set(ep, e);
+    }
+  }
+  return Array.from(sums.entries()).map(([epoch, v]) => ({
+    epoch,
+    localAccuracy: v.count ? v.localSum / v.count : 0,
+    globalAccuracy: globalByEpoch.get(epoch) ?? (v.count ? v.globalSum / v.count : 0),
+  })).sort((a, b) => a.epoch - b.epoch);
+}
+
+function mergeAccuracySeries(previousPoints, nextPoints) {
+  const mergedByEpoch = new Map();
+  for (const point of previousPoints || []) {
+    if (point?.epoch == null) continue;
+    mergedByEpoch.set(point.epoch, point);
+  }
+  for (const point of nextPoints || []) {
+    if (point?.epoch == null) continue;
+    mergedByEpoch.set(point.epoch, point);
+  }
+  return [...mergedByEpoch.values()].sort((a, b) => a.epoch - b.epoch);
+}
+
+function parseNodeStats(events) {
+  /* returns Map<nodeId, { epoch, accuracy, loss }> — latest per node */
+  const latest = new Map();
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const m = msg.match(/\[EPOCH\s+(\d+)\]\[Node\s+(\S+)\]\s+real accuracy=([0-9.]+)\s+real loss=([0-9.]+)/);
+    if (m) {
+      const epoch = +m[1], node = m[2], acc = +m[3], loss = +m[4];
+      const prev = latest.get(node);
+      if (!prev || epoch >= prev.epoch) latest.set(node, { epoch, accuracy: acc, loss });
+    }
+  }
+  return latest;
+}
+
+function parseGlobalMetrics(events) {
+  let epoch = 0, accuracy = null, loss = null, dataset = 0;
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const m = msg.match(/\[EPOCH\s+(\d+)\]\[GLOBAL\]\s+real accuracy=([0-9.]+)\s+real loss=([0-9.]+)\s+\(dataset=(\d+)\)/);
+    if (m && +m[1] >= epoch) {
+      epoch = +m[1]; accuracy = +m[2]; loss = +m[3]; dataset = +m[4];
+    }
+  }
+  return { epoch, accuracy, loss, dataset };
+}
+
+function parseEpochProgress(events) {
+  let currentEpoch = 0, maxEpoch = 10;
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const startM = msg.match(/\[EPOCH\s+(\d+)\]\s+=====\s+Federated Epoch START/);
+    if (startM) currentEpoch = Math.max(currentEpoch, +startM[1]);
+    const fedM = msg.match(/federatedEpochs[=:\s]+(\d+)/i);
+    if (fedM) maxEpoch = +fedM[1];
+  }
+  return { currentEpoch, maxEpoch };
+}
+
+function parseSessionStats(events) {
+  let sessionsCreated = 0, currentSessionId = null, currentStatus = null;
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    if (msg.match(/Session créée\s*:\s*(\S+)/)?.[1]) { sessionsCreated++; currentSessionId = msg.match(/Session créée\s*:\s*(\S+)/)[1]; currentStatus = "INIT"; }
+    if (msg.includes("en état RUNNING")) currentStatus = "RUNNING";
+    if (msg.includes("maintenant DONE") || msg.includes("Transition RUNNING → DONE")) currentStatus = "DONE";
+  }
+  return { sessionsCreated, currentSessionId, currentStatus: currentStatus || "IDLE" };
+}
+
+function parseNetworkStats(events) {
+  let activeNodes = 0, nodes = [], ideNode = null, lastUpdated = null;
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const countM = msg.match(/Nœuds actifs ciblés\s*:\s*(\d+)/);
+    if (countM) { activeNodes = +countM[1]; lastUpdated = evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null; }
+    const ideM = msg.match(/IDE Node (?:élu|réservé)\s*:\s*(\S+)/);
+    if (ideM) { ideNode = ideM[1]; lastUpdated = evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null; }
+    const listM = msg.match(/Active nodes:\s*\[(.*)\]/);
+    if (listM) { nodes = listM[1].split(",").map(n => n.trim()).filter(Boolean); activeNodes = nodes.length; lastUpdated = evt.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null; }
+  }
+  return { activeNodes, nodes, ideNode, lastUpdated };
+}
+
+function parseCommunications(events) {
+  /* parse BOTH structured COMM_EVENT_JSON (type !== SIM_LOG) and text logs */
+  const comms = [];
+  for (const evt of events || []) {
+    /* structured event (GRADIENT, GOSSIP_VOTE, DEPOT, GLOBAL_MODEL, STATE) */
+    if (evt?.type && evt.type !== "SIM_LOG" && evt.from && evt.to) {
+      comms.push({
+        id: `${evt.ts || evt.timestamp}-${evt.seq || comms.length}`,
+        time: evt.timestamp || "",
+        source: evt.from,
+        dest: evt.to,
+        commType: evt.type,
+        epoch: evt.epoch,
+        cycle: evt.cycle,
+        detail: evt.detail || "",
+        value: evt.value,
+        param: evt.param,
+        voteCount: evt.voteCount,
+      });
+    }
+  }
+  return comms;
+}
+
+function parseCommTypeCounts(communications) {
+  const counts = {};
+  for (const c of communications) {
+    counts[c.commType] = (counts[c.commType] || 0) + 1;
+  }
+  return counts;
+}
+
+function parseParamEvolution(events) {
+  const values = new Map();
+  const epochsSet = new Set(), paramsSet = new Set();
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const m = msg.match(/\[EPOCH\s+(\d+)\]\[Depot param\[(\d+)\]\].*value=([-0-9.eE]+)/);
+    if (!m) continue;
+    const ep = +m[1], param = +m[2], val = +m[3];
+    if (!isFinite(ep) || !isFinite(param) || !isFinite(val)) continue;
+    epochsSet.add(ep); paramsSet.add(param);
+    if (!values.has(ep)) values.set(ep, new Map());
+    values.get(ep).set(param, val);
+  }
+  return { epochs: [...epochsSet].sort((a,b)=>a-b), params: [...paramsSet].sort((a,b)=>a-b), values };
+}
+
+function parseSessions(events) {
+  const sessions = new Map();
+  let lastId = null;
+  const ensure = id => { if (!sessions.has(id)) sessions.set(id, { id, status: "INIT", createdAt: null, dataset: null, lastUpdated: null, samples: null, nodesUsed: null }); return sessions.get(id); };
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const cm = msg.match(/Session créée\s*:\s*(\S+)/);
+    if (cm) { lastId = cm[1]; const s = ensure(lastId); s.status = "INIT"; s.createdAt = evt.timestamp; s.lastUpdated = evt.timestamp; continue; }
+    const dm = msg.match(/Dataset\s*:\s*(.+)$/);
+    if (dm && lastId) { ensure(lastId).dataset = dm[1].trim(); }
+    if (msg.includes("en état RUNNING") && lastId) ensure(lastId).status = "RUNNING";
+    if ((msg.includes("maintenant DONE") || msg.includes("Transition RUNNING → DONE")) && lastId) { ensure(lastId).status = "DONE"; ensure(lastId).lastUpdated = evt.timestamp; }
+    const sm = msg.match(/rows=([0-9]+)/i) || msg.match(/samples=([0-9]+)/i);
+    if (sm && lastId) ensure(lastId).samples = +sm[1];
+    const nm = msg.match(/Active nodes:\s*\[(.*)\]/);
+    if (nm && lastId) ensure(lastId).nodesUsed = nm[1].split(",").filter(Boolean).length;
+  }
+  return [...sessions.values()].sort((a,b) => (new Date(b.createdAt||0)) - (new Date(a.createdAt||0)));
+}
+
+function isLearningLog(msg) {
+  if (!msg || typeof msg !== "string") return false;
+  return /epoch|accuracy|loss|dataset|batch|gradient|weights|param|model|learning|fedavg|global|local/i.test(msg)
+    && !/chord|finger|stabilize|notify|successor|predecessor|route|dht/i.test(msg);
+}
+
+/* ─── UI ATOMS ──────────────────────────────────────────── */
+function Card({ children, style, title, subtitle, action }) {
   return (
-    <aside
-      style={{
-        width: 320,
-        backgroundColor: "#1F2937",
-        color: "#fff",
-        height: "100vh",
-        position: "fixed",
-        top: 0,
-        left: 0,
-        zIndex: 100,
-        display: "flex",
-        flexDirection: "column",
-      }}
-    >
-      <div style={{ padding: "20px 16px", borderBottom: "1px solid rgba(255,255,255,0.1)" }}>
-        <h2 style={{ margin: 0, fontSize: "1.25rem", fontWeight: 700 }}>PeerSim</h2>
-        <div style={{ fontSize: "0.8rem", color: "rgba(255,255,255,0.6)", marginTop: 6 }}>
-          Session Control
+    <div style={{
+      background: T.card,
+      border: `1px solid ${T.border}`,
+      borderRadius: 12,
+      overflow: "hidden",
+      ...style,
+    }}>
+      {(title || subtitle || action) && (
+        <div style={{ padding: "14px 18px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <div>
+            {title && <div style={{ fontFamily: T.fontUI, fontSize: 13, fontWeight: 600, color: T.textPrimary, letterSpacing: "0.03em", textTransform: "uppercase" }}>{title}</div>}
+            {subtitle && <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary, marginTop: 2 }}>{subtitle}</div>}
+          </div>
+          {action}
+        </div>
+      )}
+      <div style={{ padding: "16px 18px" }}>{children}</div>
+    </div>
+  );
+}
+
+function Pill({ label, color = T.cyan }) {
+  return (
+    <span style={{
+      background: color + "22",
+      color,
+      border: `1px solid ${color}44`,
+      borderRadius: 6,
+      padding: "2px 8px",
+      fontSize: 11,
+      fontFamily: T.fontMono,
+      fontWeight: 600,
+      letterSpacing: "0.05em",
+      textTransform: "uppercase",
+    }}>{label}</span>
+  );
+}
+
+function StatusDot({ status }) {
+  const map = { RUNNING: T.green, INIT: T.amber, DONE: T.cyan, IDLE: T.textMuted };
+  const color = map[status] || T.textMuted;
+  const label = { RUNNING: "Running", INIT: "Init", DONE: "Done", IDLE: "Idle" }[status] || "Idle";
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontFamily: T.fontMono, fontSize: 11, color }}>
+      <span style={{
+        width: 7, height: 7, borderRadius: "50%", background: color,
+        animation: status === "RUNNING" ? "pulse-dot 1.5s ease-in-out infinite" : "none",
+        boxShadow: status === "RUNNING" ? `0 0 8px ${color}` : "none",
+        display: "inline-block",
+      }} />
+      {label}
+    </span>
+  );
+}
+
+function MetricCard({ label, value, unit, color = T.cyan, icon, trend }) {
+  return (
+    <div style={{
+      background: T.card,
+      border: `1px solid ${T.border}`,
+      borderRadius: 10,
+      padding: "14px 16px",
+      position: "relative",
+      overflow: "hidden",
+    }}>
+      <div style={{ position: "absolute", top: 0, left: 0, width: 3, height: "100%", background: color, borderRadius: "10px 0 0 10px" }} />
+      <div style={{ paddingLeft: 8 }}>
+        <div style={{ fontFamily: T.fontUI, fontSize: 11, color: T.textSecondary, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+          {icon && <span style={{ marginRight: 6 }}>{icon}</span>}{label}
+        </div>
+        <div style={{ fontFamily: T.fontMono, fontSize: 22, fontWeight: 700, color, lineHeight: 1 }}>
+          {value}
+          {unit && <span style={{ fontSize: 12, color: T.textSecondary, marginLeft: 4 }}>{unit}</span>}
+        </div>
+        {trend != null && <div style={{ fontFamily: T.fontMono, fontSize: 11, color: trend >= 0 ? T.green : T.red, marginTop: 4 }}>{trend >= 0 ? "▲" : "▼"} {Math.abs(trend).toFixed(4)}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ─── EPOCH PROGRESS BAR ───────────────────────────────── */
+function EpochProgressBar({ current, max }) {
+  const pct = max > 0 ? Math.min(1, current / max) : 0;
+  return (
+    <div style={{ padding: "10px 18px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", gap: 12 }}>
+      <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary, whiteSpace: "nowrap" }}>EPOCH</span>
+      <div style={{ flex: 1, background: T.surface, borderRadius: 4, height: 6, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct * 100}%`, background: `linear-gradient(90deg, ${T.cyan}, ${T.green})`, borderRadius: 4, transition: "width 0.6s ease" }} />
+      </div>
+      <span style={{ fontFamily: T.fontMono, fontSize: 12, color: T.textPrimary, fontWeight: 700, whiteSpace: "nowrap" }}>
+        {current} / {max}
+      </span>
+    </div>
+  );
+}
+
+/* ─── NODE STATUS GRID ──────────────────────────────────── */
+function NodeStatusGrid({ nodes, nodeStats, ideNode }) {
+  if (!nodes || nodes.length === 0) return <div style={{ color: T.textMuted, fontFamily: T.fontMono, fontSize: 12, textAlign: "center", padding: 16 }}>No nodes yet.</div>;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: 8 }}>
+      {nodes.map(node => {
+        const stat = nodeStats.get(node);
+        const isIde = node === ideNode;
+        const color = isIde ? T.red : stat ? T.green : T.textMuted;
+        return (
+          <div key={node} style={{
+            background: T.surface,
+            border: `1px solid ${isIde ? T.red + "60" : stat ? T.green + "30" : T.border}`,
+            borderRadius: 8,
+            padding: "8px 10px",
+            transition: "border-color 0.3s",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <span style={{ fontFamily: T.fontMono, fontSize: 12, fontWeight: 700, color }}>{node}</span>
+              {isIde && <Pill label="IDE" color={T.red} />}
+            </div>
+            {stat ? (
+              <>
+                <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.green }}>ACC <strong>{(stat.accuracy * 100).toFixed(2)}%</strong></div>
+                <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary }}>LOSS {stat.loss.toFixed(4)}</div>
+                <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.textMuted }}>EP {stat.epoch}</div>
+              </>
+            ) : (
+              <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textMuted }}>waiting…</div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ─── COMM BREAKDOWN ────────────────────────────────────── */
+const COMM_COLORS = {
+  GRADIENT:    T.cyan,
+  GOSSIP_VOTE: T.purple,
+  DEPOT:       T.amber,
+  GLOBAL_MODEL: T.green,
+  STATE:       T.red,
+};
+
+function CommBreakdown({ counts, total }) {
+  if (!total) return <div style={{ color: T.textMuted, fontFamily: T.fontMono, fontSize: 12, textAlign: "center", padding: 8 }}>No communications yet.</div>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {Object.entries(counts).map(([type, count]) => {
+        const pct = total ? count / total : 0;
+        const color = COMM_COLORS[type] || T.textSecondary;
+        return (
+          <div key={type}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+              <span style={{ fontFamily: T.fontMono, fontSize: 11, color }}>{type}</span>
+              <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary }}>{count} <span style={{ color: T.textMuted }}>({(pct * 100).toFixed(0)}%)</span></span>
+            </div>
+            <div style={{ background: T.surface, borderRadius: 3, height: 5, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${pct * 100}%`, background: color, borderRadius: 3, transition: "width 0.5s ease" }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ─── SIDEBAR ───────────────────────────────────────────── */
+function Sidebar({ onStart, onStop, onClear, onClearAllTabs, connected, sessionStatus, currentEpoch, maxEpoch, speed, onSpeedChange }) {
+  return (
+    <aside style={{
+      width: 300,
+      background: T.surface,
+      borderRight: `1px solid ${T.border}`,
+      height: "100vh",
+      position: "fixed",
+      top: 0,
+      left: 0,
+      zIndex: 100,
+      display: "flex",
+      flexDirection: "column",
+      fontFamily: T.fontUI,
+    }}>
+      {/* Logo */}
+      <div style={{ padding: "18px 20px", borderBottom: `1px solid ${T.border}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <div style={{
+            width: 32, height: 32, borderRadius: 8,
+            background: `linear-gradient(135deg, ${T.cyan}, #0060ff)`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 16,
+          }}>⬡</div>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: T.textPrimary, letterSpacing: "0.04em" }}>PeerSim DJL</div>
+            <div style={{ fontSize: 10, color: T.textSecondary, letterSpacing: "0.06em", textTransform: "uppercase" }}>Federated Learning</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: "50%",
+            background: connected ? T.green : T.red,
+            animation: connected ? "pulse-dot 2s ease-in-out infinite" : "none",
+            boxShadow: connected ? `0 0 8px ${T.green}` : "none",
+            display: "inline-block", flexShrink: 0,
+          }} />
+          <span style={{ fontSize: 11, fontFamily: T.fontMono, color: connected ? T.green : T.red }}>
+            {connected ? "WS CONNECTED" : "WS OFFLINE"}
+          </span>
+          <span style={{ marginLeft: "auto" }}><StatusDot status={sessionStatus} /></span>
         </div>
       </div>
-      <div style={{ padding: "16px", overflowY: "auto" }}>
-        <div style={{ backgroundColor: "#111827", padding: 12, borderRadius: 10 }}>
-          <LaunchForm onStart={onStart} onStop={onStop} onClear={onClear} />
+
+      {/* Epoch progress in sidebar */}
+      <div style={{ padding: "10px 20px", borderBottom: `1px solid ${T.border}` }}>
+        <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.textSecondary, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>Training Progress</div>
+        <div style={{ background: T.card, borderRadius: 4, height: 6, overflow: "hidden", marginBottom: 4 }}>
+          <div style={{ height: "100%", width: `${maxEpoch > 0 ? Math.min(100, currentEpoch / maxEpoch * 100) : 0}%`, background: `linear-gradient(90deg, ${T.cyan}, ${T.green})`, borderRadius: 4, transition: "width 0.6s ease" }} />
         </div>
-        {/* Controls for event stream */}
-        <div style={{ marginTop: 12, backgroundColor: "#111827", padding: 12, borderRadius: 8 }}>
-          <div style={{ marginBottom: 8, fontSize: "0.85rem", fontWeight: 600 }}>Event Stream Settings</div>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <input type="range" min="10" max="150" step="10" value={globalDelay} onChange={e => setGlobalDelay(Number(e.target.value))} />
-            <span>{globalDelay} ms</span>
-          </label>
-          <button onClick={() => setIsPaused(!isPaused)} style={{ backgroundColor: isPaused ? "#EF4444" : "#10B981", border: "none", color: "#fff", padding: "6px 12px", borderRadius: 4 }}>
-            {isPaused ? "Play" : "Pause"}
-          </button>
-          <div style={{ marginTop: 8, fontSize: "0.75rem" }}>Filters:</div>
-          {Object.entries(eventFilters).map(([key, val]) => (
-            <label key={key} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <input type="checkbox" checked={val} onChange={e => setEventFilters(prev => ({...prev, [key]: e.target.checked }))} />
-              {key.charAt(0).toUpperCase() + key.slice(1)}
-            </label>
-          ))}
+        <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textPrimary }}>Epoch <strong style={{ color: T.cyan }}>{currentEpoch}</strong> / {maxEpoch}</div>
+      </div>
+
+      {/* Animation speed slider */}
+      <div style={{ padding: "10px 20px", borderBottom: `1px solid ${T.border}` }}>
+        <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.textSecondary, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>Event Playback Speed</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <input
+            type="range"
+            min={0.25}
+            max={3}
+            step={0.05}
+            value={speed}
+            onChange={e => onSpeedChange(Number(e.target.value))}
+            style={{ flex: 1 }}
+          />
+          <div style={{ minWidth: 44, textAlign: "right", fontFamily: T.fontMono, fontSize: 12, color: T.textPrimary }}>{speed.toFixed(2)}x</div>
         </div>
       </div>
-      <div style={{ padding: "16px", marginTop: "auto", borderTop: "1px solid rgba(255,255,255,0.1)", fontSize: "0.75rem", color: "rgba(255,255,255,0.5)" }}>
-        PeerSim DJL v1.0
+
+      {/* Launch form */}
+      <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+        <div style={{
+          background: T.card,
+          border: `1px solid ${T.border}`,
+          borderRadius: 10,
+          overflow: "hidden",
+        }}>
+          <div style={{ padding: "10px 14px", borderBottom: `1px solid ${T.border}` }}>
+            <span style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Session Control</span>
+          </div>
+          <div style={{ padding: 12 }}>
+            <LaunchForm onStart={onStart} onStop={onStop} onClear={onClear} />
+          </div>
+        </div>
+
+        {/* Clear All Tabs Button - Summary tab protected */}
+        <button onClick={onClearAllTabs} style={{
+          width: "100%",
+          background: T.card,
+          border: `1px solid ${T.border}`,
+          color: T.amber,
+          padding: "10px",
+          borderRadius: 8,
+          cursor: "pointer",
+          fontFamily: T.fontMono,
+          fontSize: 11,
+          letterSpacing: "0.04em",
+          textTransform: "uppercase",
+          marginTop: 12,
+          transition: "all 0.2s",
+        }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = T.amber; e.currentTarget.style.background = T.amber + "22"; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = T.border; e.currentTarget.style.background = T.card; }}
+        >
+          🗑 Clear All Tabs
+        </button>
+        <div style={{ fontFamily: T.fontMono, fontSize: 9, color: T.textMuted, marginTop: 4, textAlign: "center" }}>Summary protected</div>
+      </div>
+
+      <div style={{ padding: "10px 20px", borderTop: `1px solid ${T.border}`, fontFamily: T.fontMono, fontSize: 10, color: T.textMuted }}>
+        v1.0 · React + Spring Boot
       </div>
     </aside>
   );
 }
 
-function Header({ connected, onRefresh }) {
+/* ─── HEADER ────────────────────────────────────────────── */
+function Header({ globalMetrics, connected, onRefresh }) {
+  const { epoch, accuracy, loss, dataset } = globalMetrics;
   return (
-    <header
-      style={{
-        backgroundColor: "#111827",
-        color: "#fff",
-        padding: "12px 24px",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        position: "sticky",
-        top: 0,
-        zIndex: 50,
-        boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        <div
-          style={{
-            width: 8,
-            height: 8,
-            borderRadius: "50%",
-            backgroundColor: connected ? "#10B981" : "#EF4444",
-            boxShadow: connected ? "0 0 8px rgba(16,185,129,0.6)" : "0 0 8px rgba(239,68,68,0.6)",
-          }}
-        />
-        <h1 style={{ margin: 0, fontSize: "1.25rem", fontWeight: 600 }}>PeerSim Dashboard</h1>
+    <header style={{
+      background: T.surface,
+      borderBottom: `1px solid ${T.border}`,
+      padding: "0 24px",
+      height: 56,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      position: "sticky",
+      top: 0,
+      zIndex: 50,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 24, fontFamily: T.fontMono, fontSize: 12 }}>
+        <span style={{ color: T.textSecondary }}>GLOBAL</span>
+        <span>ACC <strong style={{ color: T.green }}>{accuracy != null ? (accuracy * 100).toFixed(2) + "%" : "—"}</strong></span>
+        <span>LOSS <strong style={{ color: accuracy != null ? T.amber : T.textMuted }}>{loss != null ? loss.toFixed(4) : "—"}</strong></span>
+        <span style={{ color: T.textMuted }}>DS <strong style={{ color: T.textSecondary }}>{dataset > 0 ? dataset.toLocaleString() : "—"}</strong></span>
+        <span style={{ color: T.textMuted }}>EP <strong style={{ color: T.cyan }}>{epoch || "—"}</strong></span>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <span style={{ fontSize: "0.85rem", color: "rgba(255,255,255,0.7)" }}>
-          {connected ? "Connected" : "Disconnected"}
-        </span>
-        <button
-          onClick={onRefresh}
-          style={{
-            backgroundColor: "#3B82F6",
-            border: "none",
-            color: "#fff",
-            padding: "8px 16px",
-            borderRadius: 6,
-            cursor: "pointer",
-            fontSize: "0.85rem",
-            fontWeight: 500,
-            transition: "background-color 0.2s",
-          }}
-          onMouseEnter={(e) => (e.target.style.backgroundColor = "#2563EB")}
-          onMouseLeave={(e) => (e.target.style.backgroundColor = "#3B82F6")}
-        >
-          ↻ Refresh
-        </button>
+        <button onClick={onRefresh} style={{
+          background: "transparent",
+          border: `1px solid ${T.border}`,
+          color: T.textSecondary,
+          padding: "6px 14px",
+          borderRadius: 7,
+          cursor: "pointer",
+          fontFamily: T.fontMono,
+          fontSize: 11,
+          letterSpacing: "0.04em",
+          transition: "all 0.2s",
+        }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = T.cyan; e.currentTarget.style.color = T.cyan; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = T.border; e.currentTarget.style.color = T.textSecondary; }}
+        >↻ REFRESH</button>
       </div>
     </header>
   );
 }
 
-function Card({ children, style, hoverable }) {
+/* ─── TAB BAR ───────────────────────────────────────────── */
+function TabBar({ active, onChange }) {
+  const tabs = ["dashboard", "nodes", "comms", "summary"];
+  const labels = { dashboard: "Dashboard", nodes: "Node Grid", comms: "Communications", summary: "Summary" };
   return (
-    <div
-      style={{
-        backgroundColor: "#fff",
-        borderRadius: 12,
-        boxShadow: "0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.04)",
-        padding: 20,
-        transition: "transform 0.2s, box-shadow 0.2s",
-        ...style,
-      }}
-      onMouseEnter={(e) => {
-        if (hoverable) {
-          e.currentTarget.style.transform = "translateY(-2px)";
-          e.currentTarget.style.boxShadow = "0 4px 12px rgba(0,0,0,0.12), 0 8px 24px rgba(0,0,0,0.06)";
-        }
-      }}
-      onMouseLeave={(e) => {
-        if (hoverable) {
-          e.currentTarget.style.transform = "translateY(0)";
-          e.currentTarget.style.boxShadow = "0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.04)";
-        }
-      }}
-    >
-      {children}
+    <div style={{ display: "flex", gap: 2, padding: "0 0 0 0", marginBottom: 20 }}>
+      {tabs.map(t => (
+        <button key={t} onClick={() => onChange(t)} style={{
+          background: active === t ? T.cyan + "18" : "transparent",
+          color: active === t ? T.cyan : T.textSecondary,
+          border: `1px solid ${active === t ? T.cyan + "44" : T.border}`,
+          borderRadius: 8,
+          padding: "7px 16px",
+          cursor: "pointer",
+          fontFamily: T.fontMono,
+          fontSize: 11,
+          letterSpacing: "0.05em",
+          textTransform: "uppercase",
+          transition: "all 0.2s",
+        }}>{labels[t]}</button>
+      ))}
     </div>
   );
 }
 
-function StatCard({ label, value, icon, color }) {
+/* ─── NETWORK PANEL ─────────────────────────────────────── */
+function NetworkPanel({ nodes, ideNode, sessionNodes, communications, speed }) {
+  const recentComms = communications.slice(-60);
   return (
-    <Card style={{ display: "flex", alignItems: "center", gap: 16, padding: "16px 20px" }}>
-      <div
-        style={{
-          width: 48,
-          height: 48,
-          borderRadius: 12,
-          backgroundColor: color + "15",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize: "1.4rem",
-        }}
-      >
-        {icon}
-      </div>
-      <div>
-        <div style={{ fontSize: "0.8rem", color: "#6B7280", marginBottom: 4 }}>{label}</div>
-        <div style={{ fontSize: "1.5rem", fontWeight: 700, color: "#111827" }}>{value}</div>
+    <div>
+      <NetworkTraceGraph
+        nodes={nodes}
+        ideNode={ideNode}
+        sessionNodes={sessionNodes}
+        communications={recentComms}
+        speed={speed}
+      />
+    </div>
+  );
+}
+
+/* ─── SUMMARY TAB ───────────────────────────────────────── */
+function SummaryTab({ completedSessions }) {
+  const [selectedSessionId, setSelectedSessionId] = useState(null);
+  const selectedSession = completedSessions.find(s => s.id === selectedSessionId);
+
+  useEffect(() => {
+    if (!selectedSessionId && completedSessions.length > 0) {
+      setSelectedSessionId(completedSessions[0].id);
+    }
+  }, [selectedSessionId, completedSessions]);
+
+  /* Helper to count communication types */
+  const parseCommTypeCounts = (communications) => {
+    const counts = {};
+    for (const c of communications || []) {
+      counts[c.commType] = (counts[c.commType] || 0) + 1;
+    }
+    return counts;
+  };
+
+  if (completedSessions.length === 0) {
+    return (
+      <Card title="Session History" subtitle="Completed learning sessions">
+        <div style={{ color: T.textMuted, fontFamily: T.fontMono, fontSize: 12, textAlign: "center", padding: 32 }}>
+          Run and complete a session to see the history here.
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 16 }}>
+      {/* Sessions List */}
+      <Card title="Sessions" subtitle={`${completedSessions.length} completed`}>
+        <div style={{ maxHeight: 600, overflowY: "auto" }}>
+          {completedSessions.map(s => (
+            <div
+              key={s.id}
+              onClick={() => setSelectedSessionId(s.id)}
+              style={{
+                background: selectedSessionId === s.id ? T.surface : "transparent",
+                border: `1px solid ${selectedSessionId === s.id ? T.cyan + "44" : T.border}`,
+                borderRadius: 8,
+                padding: "10px 12px",
+                marginBottom: 8,
+                cursor: "pointer",
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = T.cyan + "44"}
+              onMouseLeave={e => e.currentTarget.style.borderColor = selectedSessionId === s.id ? T.cyan + "44" : T.border}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <span style={{ fontFamily: T.fontMono, fontSize: 11, fontWeight: 700, color: T.textPrimary, overflow: "hidden", textOverflow: "ellipsis" }}>{s.id}</span>
+                <span style={{ fontFamily: T.fontMono, fontSize: 10, color: T.green }}>{s.duration}s</span>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 4, fontSize: 10 }}>
+                <span style={{ color: T.cyan }}>⬡ {s.networkSize}</span>
+                <span style={{ color: T.purple }}>↗ {s.communications?.length || 0}</span>
+              </div>
+              {s.accuracy && <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.green }}>ACC {(s.accuracy.globalAccuracy * 100).toFixed(2)}%</div>}
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Session Details */}
+      {selectedSession ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <Card title={selectedSession.id} subtitle={selectedSession.dataset || "—"}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, marginBottom: 16 }}>
+              <MetricCard label="Duration" value={selectedSession.duration} unit="s" color={T.cyan} />
+              <MetricCard label="Nodes Used" value={selectedSession.networkSize} color={T.purple} />
+              <MetricCard label="Messages" value={selectedSession.communications?.length || 0} color={T.amber} />
+              <MetricCard label="Final Accuracy" value={selectedSession.accuracy ? (selectedSession.accuracy.globalAccuracy * 100).toFixed(2) + "%" : "—"} color={T.green} />
+            </div>
+            
+            {/* Accuracy Chart */}
+            {selectedSession.accuracyPoints?.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary, textTransform: "uppercase", marginBottom: 8, letterSpacing: "0.06em" }}>Training Accuracy</div>
+                <AccuracyChart accuracyPoints={selectedSession.accuracyPoints} height={200} showLegend={true} />
+              </div>
+            )}
+          </Card>
+
+          {/* Communications Breakdown */}
+          {selectedSession.communications?.length > 0 && (
+            <Card title="Communication Summary" subtitle={`${selectedSession.communications.length} messages exchanged`}>
+              <CommBreakdown counts={parseCommTypeCounts(selectedSession.communications)} total={selectedSession.communications.length} />
+            </Card>
+          )}
+
+          {/* Detailed Communications Log */}
+          {selectedSession.communications?.length > 0 && (
+            <Card title="Message Log" subtitle="All communications during this session">
+              <div style={{ height: 300, overflowY: "auto", fontFamily: T.fontMono, fontSize: 11 }}>
+                {selectedSession.communications.slice(-50).reverse().map((c, i) => {
+                  const color = COMM_COLORS[c.commType] || T.textSecondary;
+                  return (
+                    <div key={i} style={{
+                      display: "flex", alignItems: "center", gap: 8,
+                      padding: "4px 0", borderBottom: `1px solid ${T.border}30`,
+                      animation: "fadeIn 0.2s ease",
+                    }}>
+                      <span style={{ background: color + "22", color, border: `1px solid ${color}44`, borderRadius: 4, padding: "0px 4px", fontSize: 9, fontWeight: 700, minWidth: 70, textAlign: "center" }}>{c.commType}</span>
+                      <span style={{ color: T.textPrimary, fontWeight: 700, minWidth: 60 }}>{c.source}</span>
+                      <span style={{ color: T.textMuted }}>→</span>
+                      <span style={{ color: T.textPrimary, minWidth: 60 }}>{c.dest}</span>
+                      {c.epoch != null && <span style={{ color: T.textMuted, marginLeft: "auto", fontSize: 9 }}>E{c.epoch}C{c.cycle}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+        </div>
+      ) : (
+        <Card title="Session Details" subtitle="Select a session to view details">
+          <div style={{ color: T.textMuted, fontFamily: T.fontMono, fontSize: 12, textAlign: "center", padding: 32 }}>
+            Click on a session to view all its information.
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ─── COMMS TAB ─────────────────────────────────────────── */
+function CommsTab({ communications, ideNode }) {
+  /* Display ALL communications (not just last 100) */
+  const allComms = communications.slice().reverse(); /* Reverse but keep all */
+  return (
+    <Card title="Communication Log" subtitle={`${communications.length} total messages`}>
+      <div style={{ height: 480, overflowY: "auto", fontFamily: T.fontMono, fontSize: 12 }}>
+        {allComms.length === 0 && <div style={{ color: T.textMuted, textAlign: "center", padding: 24 }}>No structured communications received yet.</div>}
+        {allComms.map((c, i) => {
+          const color = COMM_COLORS[c.commType] || T.textSecondary;
+          return (
+            <div key={c.id || i} style={{
+              display: "flex", alignItems: "center", gap: 10,
+              padding: "5px 0", borderBottom: `1px solid ${T.border}30`,
+              animation: "fadeIn 0.2s ease",
+            }}>
+              <span style={{ color: T.textMuted, minWidth: 70, fontSize: 10 }}>{c.time}</span>
+              <span style={{ background: color + "22", color, border: `1px solid ${color}44`, borderRadius: 4, padding: "1px 6px", fontSize: 10, fontWeight: 700, whiteSpace: "nowrap", minWidth: 90, textAlign: "center" }}>{c.commType}</span>
+              <span style={{ color: T.textPrimary, fontWeight: 700 }}>{c.source}</span>
+              <span style={{ color: T.textMuted }}>→</span>
+              <span style={{ color: c.dest === ideNode ? T.red : T.textPrimary }}>{c.dest}</span>
+              {c.epoch != null && <span style={{ color: T.textMuted, marginLeft: "auto", fontSize: 10 }}>E{c.epoch}C{c.cycle}</span>}
+              {c.param && <span style={{ color: T.purple, fontSize: 10 }}>{c.param}</span>}
+              {c.voteCount && <span style={{ color: T.amber, fontSize: 10 }}>{c.voteCount}</span>}
+            </div>
+          );
+        })}
       </div>
     </Card>
   );
 }
 
-function StatusBadge({ status }) {
-  const config = {
-    RUNNING: { bg: "#D1FAE5", color: "#065F46", text: "Running" },
-    INIT: { bg: "#FEF3C7", color: "#92400E", text: "Initializing" },
-    DONE: { bg: "#DBEAFE", color: "#1E40AF", text: "Completed" },
-    IDLE: { bg: "#F3F4F6", color: "#374151", text: "Idle" },
-  };
-  const c = config[status] || config.IDLE;
-  return (
-    <span
-      style={{
-        backgroundColor: c.bg,
-        color: c.color,
-        padding: "4px 10px",
-        borderRadius: 20,
-        fontSize: "0.75rem",
-        fontWeight: 600,
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-      }}
-    >
-      <span style={{ width: 6, height: 6, borderRadius: "50%", backgroundColor: c.color, display: "inline-block" }} />
-      {c.text}
-    </span>
-  );
-}
-
-function QuickStats({ networkStats, sessionStats, eventCount, connected }) {
-  return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-        gap: 16,
-        marginBottom: 24,
-      }}
-    >
-      <StatCard label="Active Nodes" value={networkStats.activeNodes || 0} icon="🖥️" color="#3B82F6" />
-      <StatCard label="Total Nodes" value={(networkStats.nodes || []).length} icon="🌐" color="#8B5CF6" />
-      <StatCard label="Session Status" value={<StatusBadge status={sessionStats.currentStatus} />} icon="⚡" color="#F59E0B" />
-      <StatCard label="Events Logged" value={eventCount} icon="📋" color="#10B981" />
-      <StatCard label="Connection" value={connected ? "Online" : "Offline"} icon={connected ? "✅" : "❌"} color={connected ? "#10B981" : "#EF4444"} />
-    </div>
-  );
-}
-
-function NetworkPanel({ networkStats, communications, sessionNodes }) {
-  const effectiveIde = networkStats.ideNode || sessionNodes[0] || networkStats.nodes[0];
-  return (
-    <div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-        <h3 style={{ margin: 0, fontSize: "1rem", fontWeight: 600, color: "#111827" }}>Network Topology</h3>
-        <span style={{ fontSize: "0.8rem", color: "#6B7280" }}>Updated: {networkStats.lastUpdated || "—"}</span>
-      </div>
-      <NetworkTraceGraph
-        nodes={networkStats.nodes}
-        ideNode={effectiveIde}
-        sessionNodes={sessionNodes}
-        communications={communications}
-      />
-      {networkStats.nodes.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
-          {networkStats.nodes.map((node) => (
-            <span
-              key={node}
-              style={{
-                backgroundColor: node === networkStats.ideNode ? "#FEE2E2" : "#E5E7EB",
-                color: node === networkStats.ideNode ? "#991B1B" : "#374151",
-                padding: "4px 10px",
-                borderRadius: 6,
-                fontSize: "0.8rem",
-                fontWeight: node === networkStats.ideNode ? 600 : 400,
-              }}
-            >
-              {node} {node === networkStats.ideNode ? "(IDE)" : ""}
-            </span>
-          ))}
-        </div>
-      )}
-      <div style={{ marginTop: 16, borderTop: "1px solid #F3F4F6", paddingTop: 12 }}>
-        <h4 style={{ margin: "0 0 8px", fontSize: "0.9rem", color: "#374151" }}>Recent Communications</h4>
-        <div style={{ maxHeight: 300, overflowY: "auto", fontSize: "0.8rem" }}>
-          {(communications || []).length === 0 && <div style={{ color: "#9CA3AF" }}>No communications yet.</div>}
-          {(communications || []).slice(-50).reverse().map((comm) => (
-            <div
-              key={comm.id}
-              style={{
-                padding: "6px 0",
-                borderBottom: "1px solid #F9FAFB",
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontSize: "0.78rem",
-              }}
-            >
-              <span style={{ color: "#9CA3AF", minWidth: 65 }}>{comm.time}</span>
-              <span style={{ fontWeight: 600, color: "#111827" }}>{comm.source}</span>
-              <span style={{ color: "#D1D5DB" }}>→</span>
-              <span style={{ color: comm.dest === effectiveIde ? "#DC2626" : "#111827" }}>{comm.dest}</span>
-              <span
-                style={{
-                  backgroundColor: "#F3F4F6",
-                  color: "#374151",
-                  borderRadius: 4,
-                  padding: "2px 6px",
-                  fontSize: "0.7rem",
-                  marginLeft: "auto",
-                }}
-              >
-                {comm.commType}
-              </span>
-              {comm.epoch && (
-                <span style={{ color: "#6B7280", fontSize: "0.7rem" }}>E{comm.epoch}</span>
-              )}
-              {comm.samples && (
-                <span style={{ color: "#6B7280", fontSize: "0.7rem" }}>rows={comm.samples}</span>
-              )}
-              {comm.paramIndex && (
-                <span style={{ color: "#3B82F6", fontSize: "0.7rem", marginLeft: 4 }}>P{comm.paramIndex}</span>
-              )}
-              {comm.targetIndex && (
-                <span style={{ color: "#10B981", fontSize: "0.7rem", marginLeft: 4 }}>→N{comm.targetIndex}</span>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function SessionsPanel({ sessions, selectedSessionId, onSelect, sessionStats }) {
-  const selected = sessions.find((s) => s.id === selectedSessionId) || null;
-  return (
-    <div>
-      <h3 style={{ margin: "0 0 12px", fontSize: "1rem", fontWeight: 600, color: "#111827" }}>Sessions</h3>
-      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 16 }}>
-        <div>
-          <div style={{ fontSize: "0.8rem", color: "#6B7280", marginBottom: 8 }}>
-            Total sessions: {sessions.length}
-          </div>
-          <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid #E5E7EB", borderRadius: 10 }}>
-            {sessions.length === 0 && (
-              <div style={{ padding: 12, color: "#9CA3AF" }}>No sessions yet.</div>
-            )}
-            {sessions.map((s) => (
-              <div
-                key={s.id}
-                onClick={() => onSelect(s.id)}
-                style={{
-                  padding: "10px 12px",
-                  cursor: "pointer",
-                  backgroundColor: s.id === selectedSessionId ? "#EEF2FF" : "#fff",
-                  borderBottom: "1px solid #F3F4F6",
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span style={{ fontWeight: 600, color: "#111827", fontFamily: "monospace" }}>{s.id}</span>
-                  <StatusBadge status={s.status} />
-                </div>
-                <div style={{ fontSize: "0.75rem", color: "#6B7280", marginTop: 4 }}>
-                  {s.dataset || "Dataset: —"}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div style={{ border: "1px solid #E5E7EB", borderRadius: 10, padding: 12 }}>
-          <div style={{ fontSize: "0.85rem", color: "#6B7280", marginBottom: 8 }}>Selected session</div>
-          {!selected && (
-            <div style={{ color: "#9CA3AF" }}>Select a session to see details.</div>
-          )}
-          {selected && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ fontWeight: 700, color: "#111827" }}>{selected.id}</div>
-              <div><StatusBadge status={selected.status} /></div>
-              <div style={{ fontSize: "0.8rem", color: "#6B7280" }}>{selected.dataset || "Dataset: —"}</div>
-              <div style={{ fontSize: "0.8rem", color: "#6B7280" }}>
-                Last update: {selected.lastUpdated ? new Date(selected.lastUpdated).toLocaleTimeString("en-GB") : "—"}
-              </div>
-            </div>
-          )}
-          <div style={{ marginTop: 16, fontSize: "0.8rem", color: "#6B7280" }}>
-            Current session: {sessionStats.currentSessionId || "—"}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function SummaryTab({ sessionsSummary, learningHistory }) {
-  return (
-    <div>
-      <h3 style={{ margin: "0 0 12px", fontSize: "1rem", fontWeight: 600, color: "#111827" }}>
-        Learning History
-      </h3>
-      {learningHistory.length === 0 && (
-        <div style={{ color: "#9CA3AF", marginBottom: 16 }}>No learning runs yet.</div>
-      )}
-      {learningHistory.length > 0 && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 16, marginBottom: 24 }}>
-          {learningHistory.map((run) => (
-            <Card key={run.id} hoverable>
-              <div style={{ fontWeight: 700, color: "#111827", fontFamily: "monospace", marginBottom: 6 }}>
-                {run.sessionId || run.id}
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "#374151", marginBottom: 4 }}>
-                Start: <strong>{run.startedAtLabel || "—"}</strong>
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "#374151", marginBottom: 4 }}>
-                Dataset: <strong>{run.dataset || "—"}</strong>
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "#374151" }}>
-                Summary: <strong>{run.summary || "—"}</strong>
-              </div>
-            </Card>
-          ))}
-        </div>
-      )}
-      <h3 style={{ margin: "0 0 12px", fontSize: "1rem", fontWeight: 600, color: "#111827" }}>
-        Sessions Summary
-      </h3>
-      {sessionsSummary.length === 0 && (
-        <div style={{ color: "#9CA3AF" }}>No session summaries yet.</div>
-      )}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 16 }}>
-        {sessionsSummary.map((session) => (
-          <Card key={session.id} hoverable>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <div style={{ fontWeight: 700, color: "#111827", fontFamily: "monospace" }}>{session.id}</div>
-              <StatusBadge status={session.status} />
-            </div>
-            <div style={{ fontSize: "0.8rem", color: "#6B7280", marginBottom: 8 }}>
-              {session.dataset || "Dataset: —"}
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
-              <div style={{ fontSize: "0.8rem", color: "#374151" }}>
-                Duration: <strong>{session.duration || "—"}</strong>
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "#374151" }}>
-                Samples: <strong>{session.samples ?? "—"}</strong>
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "#374151" }}>
-                Nodes used: <strong>{session.nodesUsed ?? "—"}</strong>
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "#374151" }}>
-                Last update: <strong>{session.lastUpdatedLabel || "—"}</strong>
-              </div>
-            </div>
-            {session.points.length === 0 && (
-              <div style={{ color: "#9CA3AF", fontSize: "0.8rem" }}>No accuracy data.</div>
-            )}
-            {session.points.length > 0 && (
-              <AccuracyChart accuracyPoints={session.points} height={180} showLegend={false} />
-            )}
-          </Card>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function Footer() {
-  return (
-    <footer
-      style={{
-        textAlign: "center",
-        padding: "16px",
-        color: "#9CA3AF",
-        fontSize: "0.75rem",
-        borderTop: "1px solid #E5E7EB",
-        marginTop: 32,
-      }}
-    >
-      PeerSim DJL Dashboard • Built with React & Spring Boot
-    </footer>
-  );
-}
-
-function parseAccuracy(events) {
-  const accuracyPoints = [];
-  const sums = new Map();
-  const globalByEpoch = new Map();
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-    const match = message.match(/\[EPOCH\s+(\d+)\]\[COMPARE\].*localAcc=([0-9.]+)\s+globalAcc=([0-9.]+)/);
-    if (!match) continue;
-    const epoch = Number(match[1]);
-    const localAccuracy = Number(match[2]);
-    const globalAccuracy = Number(match[3]);
-    if (Number.isNaN(epoch) || Number.isNaN(localAccuracy) || Number.isNaN(globalAccuracy)) continue;
-    const existing = sums.get(epoch) || { localSum: 0, globalSum: 0, count: 0 };
-    existing.localSum += localAccuracy;
-    existing.globalSum += globalAccuracy;
-    existing.count += 1;
-    sums.set(epoch, existing);
-  }
-
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-
-    const globalMatch = message.match(/\[EPOCH\s+(\d+)\]\[GLOBAL\]\s+real accuracy=([0-9.]+)/);
-    if (globalMatch) {
-      const epoch = Number(globalMatch[1]);
-      const globalAccuracy = Number(globalMatch[2]);
-      if (!Number.isNaN(epoch) && !Number.isNaN(globalAccuracy)) {
-        globalByEpoch.set(epoch, globalAccuracy);
-      }
-    }
-
-    const localMatch = message.match(/\[EPOCH\s+(\d+)\]\[Node\s+(\S+)\]\s+real accuracy=([0-9.]+)/);
-    if (localMatch) {
-      const epoch = Number(localMatch[1]);
-      const localAccuracy = Number(localMatch[3]);
-      if (!Number.isNaN(epoch) && !Number.isNaN(localAccuracy)) {
-        const existing = sums.get(epoch) || { localSum: 0, globalSum: 0, count: 0 };
-        existing.localSum += localAccuracy;
-        existing.count += 1;
-        sums.set(epoch, existing);
-      }
-    }
-  }
-
-  for (const [epoch, value] of sums.entries()) {
-    const globalAccuracy = globalByEpoch.has(epoch)
-      ? globalByEpoch.get(epoch)
-      : value.count > 0
-        ? value.globalSum / value.count
-        : 0;
-    accuracyPoints.push({
-      epoch,
-      localAccuracy: value.count > 0 ? value.localSum / value.count : 0,
-      globalAccuracy,
-    });
-  }
-  return accuracyPoints.sort((a, b) => a.epoch - b.epoch);
-}
-
-function parseParamEvolution(events) {
-  const values = new Map();
-  const epochsSet = new Set();
-  const paramsSet = new Set();
-
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-    const match = message.match(/\[EPOCH\s+(\d+)\]\[Depot param\[(\d+)\]\].*value=([-0-9.eE]+)/);
-    if (!match) continue;
-    const epoch = Number(match[1]);
-    const param = Number(match[2]);
-    const value = Number(match[3]);
-    if (!Number.isFinite(epoch) || !Number.isFinite(param) || !Number.isFinite(value)) continue;
-    epochsSet.add(epoch);
-    paramsSet.add(param);
-    if (!values.has(epoch)) values.set(epoch, new Map());
-    values.get(epoch).set(param, value);
-  }
-
-  const epochs = Array.from(epochsSet).sort((a, b) => a - b);
-  const params = Array.from(paramsSet).sort((a, b) => a - b);
-  return { epochs, params, values };
-}
-
-function isLearningLog(message) {
-  if (!message || typeof message !== "string") return false;
-  return /epoch|accuracy|loss|dataset|batch|gradient|weights|param|model|learning|fedavg|global|local/i.test(message)
-    && !/chord|finger|stabilize|notify|successor|predecessor|route|dht/i.test(message);
-}
-
-function isLearningCommunication(message) {
-  if (!message || typeof message !== "string") return false;
-  if (/chord|finger|stabilize|notify|successor|predecessor|route|dht|join|leave/i.test(message)) return false;
-  return /epoch|accuracy|loss|dataset|batch|gradient|weights|param|model|learning|fedavg|global|local|ide node|élu|election|élection|leader|coordinator|aggregat/i.test(message);
-}
-
-function getEventCategory(event) {
-  const message = event?.message || '';
-  if (/chord|finger|stabilize|notify|successor|predecessor|route|dht|join|leave|lookup|replication|stabilisation|réparation/i.test(message)) {
-    return 'network';
-  }
-  if (/session|IDE élu|election|élection|leader|coordinator|requête/i.test(message)) {
-    return 'session';
-  }
-  if (/batch|dht|stockage|récupération|publication|dépôt/i.test(message)) {
-    return 'dht';
-  }
-  if (/epoch|accuracy|loss|learning|training|gradient|agrégation|fedavg|convergence|vote|entraînement|époque/i.test(message)) {
-    return 'learning';
-  }
-  return 'other';
-}
-
-function parseNetworkStats(events) {
-  let activeNodes = 0;
-  let nodes = [];
-  let ideNode = null;
-  let lastUpdated = null;
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-    const countMatch = message.match(/Nœuds actifs ciblés\s*:\s*(\d+)/);
-    if (countMatch) {
-      activeNodes = Number(countMatch[1]);
-      lastUpdated = evt?.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null;
-    }
-    const ideMatch = message.match(/IDE Node (?:élu|réservé)\s*:\s*(\S+)/);
-    if (ideMatch) {
-      ideNode = ideMatch[1];
-      lastUpdated = evt?.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null;
-    }
-    const listMatch = message.match(/Active nodes:\s*\[(.*)\]/);
-    if (listMatch) {
-      nodes = listMatch[1].split(",").map((n) => n.trim()).filter(Boolean);
-      activeNodes = nodes.length;
-      lastUpdated = evt?.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null;
-    }
-  }
-  return { activeNodes, nodes, ideNode, lastUpdated };
-}
-
-function parseCommunications(events, ideNode) {
-  const communications = [];
-  const typePatterns = [
-    { type: "GRADIENT", re: /gradient|poids|weights|param/i },
-    { type: "MODEL", re: /model|aggr[ée]gat|fusion/i },
-    { type: "BATCH", re: /batch|dataset|distribu/i },
-    { type: "VOTE", re: /vote|convergence|accuracy/i },
-    { type: "EPOCH", re: /epoch|f[ée]d[ée]r[ée]|global/i },
-    { type: "ELECTION", re: /ide node|élu|election|élection|leader|coordinator/i },
-    { type: "DHT_PUT", re: /ChordProtocol\.put|PUT \[gradient\]/i },
-    { type: "DHT_GET", re: /ChordProtocol\.get|GET \[gradient\]/i },
-    { type: "DHT_LOOKUP", re: /ChordProtocol\.lookup|Lookup/i },
-    { type: "AGGREGATION", re: /aggregation triggered|aggregate\(\)/i },
-  ];
-
-  const detectType = (message) => {
-    for (const entry of typePatterns) {
-      if (entry.re.test(message)) return entry.type;
-    }
-    return "LOG";
-  };
-
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-    if (evt?.type && evt.type !== "SIM_LOG") continue;
-
-
-    // Extraire le nœud source
-    const nodeMatch = message.match(/\[Node\s+(\S+)\]/)
-      || message.match(/\[([N][\w]*)\]/)
-      || message.match(/node[=:\s]+([A-Za-z0-9_-]+)/i);
-    const source = nodeMatch ? nodeMatch[1] : null;
-    if (!source) continue;
-
-    // Extraire la destination de manière plus précise
-    let dest = null;
-
-    // Pattern: "... to Node X" ou "... to N1"
-    const toMatch = message.match(/to\s+(?:Node\s+)?([A-Za-z0-9_-]+)/i);
-    if (toMatch) dest = toMatch[1];
-
-    // Pattern: "... → N1" ou "...-> N2"
-    if (!dest) {
-      const arrowMatch = message.match(/[→\-]>[\s]*([A-Za-z0-9_-]+)/);
-      if (arrowMatch) dest = arrowMatch[1];
-    }
-
-    // Pattern: "target=N2" or "target: N2"
-    if (!dest) {
-      const targetMatch = message.match(/target[\s:=]+([A-Za-z0-9_-]+)/i);
-      if (targetMatch) dest = targetMatch[1];
-    }
-
-    // Pattern: "IDE Node", "peer N1"
-    if (!dest) {
-      const peerMatch = message.match(/peer\s+([A-Za-z0-9_-]+)/i)
-        || message.match(/IDE\s+Node\s+([A-Za-z0-9_-]+)/i);
-      if (peerMatch) dest = peerMatch[1];
-    }
-
-    // Si pas de destination claire, fallback vers IDE
-    if (!dest) dest = ideNode || "IDE";
-
-    const epochMatch = message.match(/\[EPOCH\s+(\d+)\]/);
-    const epoch = epochMatch ? epochMatch[1] : null;
-    const samplesMatch = message.match(/rows=([0-9]+)/i) || message.match(/samples=([0-9]+)/i);
-    const samples = samplesMatch ? samplesMatch[1] : null;
-    // Extract paramIndex and targetIndex from gradient logs
-    const paramMatch = message.match(/param\[(\d+)\]/i);
-    const paramIndex = paramMatch ? paramMatch[1] : null;
-    const targetMatch = message.match(/target=N(\d+)/i);
-    const targetIndex = targetMatch ? targetMatch[1] : null;
-
-    const time = evt?.timestamp
-      ? new Date(evt.timestamp).toLocaleTimeString("en-GB")
-      : "--:--:--";
-
-    // Exclure les logs de maintenance du finger Chord
-    if (message && /finger\[/i.test(message)) {
-      continue;
-    }
-
-    communications.push({
-      id: `${evt.timestamp || "no-ts"}-${source}-${dest}-${message.slice(0, 40)}`,
-      time,
-      source,
-      dest,
-      commType: detectType(message),
-      epoch,
-      samples,
-      paramIndex,
-      targetIndex,
-      summary: message.length > 80 ? message.slice(0, 80) + "…" : message,
-    });
-  }
-  return communications;
-}
-
-function parseSessionStats(events) {
-  let sessionsCreated = 0;
-  let currentSessionId = null;
-  let currentStatus = null;
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-    const createdMatch = message.match(/Session créée\s*:\s*(\S+)/);
-    if (createdMatch) {
-      sessionsCreated += 1;
-      currentSessionId = createdMatch[1];
-      currentStatus = "INIT";
-    }
-    const initMatch = message.match(/Session\s+(\S+)\s*:\s*initialisation/);
-    if (initMatch) {
-      currentSessionId = initMatch[1];
-      currentStatus = "INIT";
-    }
-    if (message.includes("en état RUNNING")) {
-      currentStatus = "RUNNING";
-    }
-    if (message.includes("maintenant DONE")) {
-      currentStatus = "DONE";
-    }
-  }
-  return { sessionsCreated, currentSessionId, currentStatus };
-}
-
-function parseSessions(events) {
-  const sessions = new Map();
-  let lastSessionId = null;
-
-  const ensureSession = (sessionId) => {
-    if (!sessions.has(sessionId)) {
-      sessions.set(sessionId, {
-        id: sessionId,
-        status: "INIT",
-        createdAt: null,
-        dataset: null,
-        lastUpdated: null,
-        samples: null,
-        nodesUsed: null,
-      });
-    }
-    return sessions.get(sessionId);
-  };
-
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-
-    const createdMatch = message.match(/Session créée\s*:\s*(\S+)/);
-    if (createdMatch) {
-      const sessionId = createdMatch[1];
-      lastSessionId = sessionId;
-      const s = ensureSession(sessionId);
-      s.status = "INIT";
-      s.createdAt = evt?.timestamp || s.createdAt;
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-      continue;
-    }
-
-    const initMatch = message.match(/Session\s+(\S+)\s*:\s*initialisation/);
-    if (initMatch) {
-      const sessionId = initMatch[1];
-      lastSessionId = sessionId;
-      const s = ensureSession(sessionId);
-      s.status = "INIT";
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-      continue;
-    }
-
-    const summarySessionMatch = message.match(/Session\s*:\s*(\S+)/);
-    if (summarySessionMatch) {
-      const sessionId = summarySessionMatch[1];
-      lastSessionId = sessionId;
-      ensureSession(sessionId).lastUpdated = evt?.timestamp || ensureSession(sessionId).lastUpdated;
-    }
-
-    const datasetMatch = message.match(/Dataset\s*:\s*(.+)$/);
-    if (datasetMatch && lastSessionId) {
-      const s = ensureSession(lastSessionId);
-      s.dataset = datasetMatch[1].trim();
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-    }
-
-    if (message.includes("en état RUNNING") && lastSessionId) {
-      const s = ensureSession(lastSessionId);
-      s.status = "RUNNING";
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-    }
-
-    if (message.includes("maintenant DONE") && lastSessionId) {
-      const s = ensureSession(lastSessionId);
-      s.status = "DONE";
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-    }
-
-    const samplesMatch = message.match(/rows=([0-9]+)/i) || message.match(/samples=([0-9]+)/i);
-    if (samplesMatch && lastSessionId) {
-      const s = ensureSession(lastSessionId);
-      s.samples = Number(samplesMatch[1]);
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-    }
-
-    const nodesMatch = message.match(/Active nodes:\s*\[(.*)\]/);
-    if (nodesMatch && lastSessionId) {
-      const nodes = nodesMatch[1].split(",").map((n) => n.trim()).filter(Boolean);
-      const s = ensureSession(lastSessionId);
-      s.nodesUsed = nodes.length;
-      s.lastUpdated = evt?.timestamp || s.lastUpdated;
-    }
-  }
-
-  return Array.from(sessions.values()).sort((a, b) => {
-    const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-    const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-    return bTime - aTime;
-  });
-}
-
-function parseSessionAccuracy(events) {
-  const bySession = new Map();
-  let currentEpoch = null;
-  let currentSession = null;
-
-  const ensure = (sessionId) => {
-    if (!bySession.has(sessionId)) {
-      bySession.set(sessionId, { points: [], dataset: null });
-    }
-    return bySession.get(sessionId);
-  };
-
-  for (const evt of events || []) {
-    const message = evt?.message;
-    if (!message || typeof message !== "string") continue;
-
-    const epochMatch = message.match(/\[EPOCH\s+(\d+)\]\s+SUMMARY/);
-    if (epochMatch) {
-      currentEpoch = Number(epochMatch[1]);
-      currentSession = null;
-      continue;
-    }
-
-    const sessionMatch = message.match(/Session\s*:\s*(\S+)/);
-    if (sessionMatch) {
-      currentSession = sessionMatch[1];
-      ensure(currentSession);
-      continue;
-    }
-
-    const datasetMatch = message.match(/Dataset\s*:\s*(.+)$/);
-    if (datasetMatch && currentSession) {
-      ensure(currentSession).dataset = datasetMatch[1].trim();
-      continue;
-    }
-
-    const globalMatch = message.match(/GLOBAL\s+\|\s+acc=([0-9.]+)/);
-    if (globalMatch && currentSession != null && currentEpoch != null) {
-      const acc = Number(globalMatch[1]);
-      if (Number.isFinite(acc)) {
-        ensure(currentSession).points.push({
-          epoch: currentEpoch,
-          localAccuracy: acc,
-          globalAccuracy: acc,
-        });
-      }
-    }
-  }
-
-  return bySession;
-}
-
+/* ─── MAIN APP ──────────────────────────────────────────── */
 export default function App() {
-  const { events: rawEvents, connected } = useWebSocket(
+  useFonts();
+
+  const { events, communications: wsCommunications, connected, clearEvents, clearCommunications } = useWebSocket(
     "ws://localhost:8080/ws",
     "http://localhost:8080/api/simulations/events?limit=2000"
   );
 
-  const [clearTick, setClearTick] = useState(0);
-  const [networkSize, setNetworkSize] = useState(0);
-  const [selectedSessionId, setSelectedSessionId] = useState(null);
-  const [activeTab, setActiveTab] = useState("dashboard");
-  const [summaryHistory, setSummaryHistory] = useState([]);
-  const [learningHistory, setLearningHistory] = useState([]);
-  const [globalDelay, setGlobalDelay] = useState(800);
-  const [isPaused, setIsPaused] = useState(false);
-  const [eventFilters, setEventFilters] = useState({
-    network: true,
-    learning: true,
-    session: true,
-    dht: true,
+  const [networkSize, setNetworkSize]       = useState(0);
+  const [selectedTab, setSelectedTab]       = useState("dashboard");
+  const [lastNetworkStats, setLastNetworkStats] = useState({ activeNodes: 0, nodes: [], ideNode: null, lastUpdated: null });
+  const [lastAccuracyPoints, setLastAccuracyPoints] = useState([]);
+  const [lastComms, setLastComms]           = useState([]);
+  const [eventSpeed, setEventSpeed]         = useState(1);
+  const [completedSessions, setCompletedSessions] = useState(() => {
+    try {
+      const raw = localStorage.getItem("peersim.completedSessions");
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
   });
+  const [currentSessionStart, setCurrentSessionStart] = useState(null);
+  
+  /* ---- Refs to store current values for useEffect access ---- */
+  const currentDataRef = useRef({});
+  const previousStatusRef = useRef("IDLE");
 
+  /* ---- derived state ---- */
+  const filteredEvents = useMemo(() => events || [], [events]);
+
+  const accuracyPoints  = useMemo(() => parseAccuracy(filteredEvents),       [filteredEvents]);
+  const nodeStats       = useMemo(() => parseNodeStats(filteredEvents),       [filteredEvents]);
+  const globalMetrics   = useMemo(() => parseGlobalMetrics(filteredEvents),   [filteredEvents]);
+  const epochProgress   = useMemo(() => parseEpochProgress(filteredEvents),   [filteredEvents]);
+  const sessionStats    = useMemo(() => parseSessionStats(filteredEvents),     [filteredEvents]);
+  const networkStats    = useMemo(() => parseNetworkStats(filteredEvents),     [filteredEvents]);
+  const sessions        = useMemo(() => parseSessions(filteredEvents),         [filteredEvents]);
+  const communications = useMemo(() => {
+    const fromEvents = parseCommunications(filteredEvents);
+    if (!wsCommunications || wsCommunications.length === 0) return fromEvents;
+    const merged = new Map();
+    for (const c of fromEvents) merged.set(c.id, c);
+    for (const c of wsCommunications) {
+      const id = c.id || `${c.ts || c.timestamp || ""}-${c.type || c.commType || "COMM"}-${c.source || c.from || "?"}-${c.dest || c.to || "?"}-${c.epoch ?? ""}-${c.cycle ?? ""}`;
+      merged.set(id, {
+        id,
+        time: c.timestamp || c.time || "",
+        source: c.source || c.from,
+        dest: c.dest || c.to,
+        commType: c.commType || c.type,
+        epoch: c.epoch,
+        cycle: c.cycle,
+        detail: c.detail || "",
+        value: c.value,
+        param: c.param,
+        voteCount: c.voteCount,
+      });
+    }
+    return [...merged.values()];
+  }, [filteredEvents, wsCommunications]);
+  const commCounts      = useMemo(() => parseCommTypeCounts(communications),   [communications]);
+  const paramEvolution  = useMemo(() => parseParamEvolution(filteredEvents),   [filteredEvents]);
+  const learningEvents  = useMemo(() => (filteredEvents || []).filter(e => isLearningLog(e?.message)), [filteredEvents]);
+  const displayedAccuracyPoints = useMemo(
+    () => mergeAccuracySeries(lastAccuracyPoints, accuracyPoints),
+    [lastAccuracyPoints, accuracyPoints]
+  );
+
+  const allNodes = useMemo(() => {
+    if (!networkSize || networkSize < 1) return networkStats.nodes;
+    return Array.from({ length: networkSize }, (_, i) => `N${i}`);
+  }, [networkSize, networkStats.nodes]);
+
+  /* ---- persist last-good values ---- */
+  useEffect(() => { if (networkStats.nodes.length > 0) setLastNetworkStats(networkStats); }, [networkStats]);
+  useEffect(() => {
+    if (accuracyPoints.length === 0) return;
+    setLastAccuracyPoints(prev => mergeAccuracySeries(prev, accuracyPoints));
+  }, [accuracyPoints]);
+  useEffect(() => {
+    if (!communications.length) return;
+    setLastComms(prev => {
+      const merged = new Map();
+      for (const c of prev) merged.set(c.id, c);
+      for (const c of communications) merged.set(c.id, c);
+      const arr = [...merged.values()];
+      return arr.length > 2000 ? arr.slice(arr.length - 2000) : arr;
+    });
+  }, [communications]);
+
+  /* ---- Update ref with latest data ---- */
+  useEffect(() => {
+    currentDataRef.current = {
+      sessionStats,
+      currentSessionStart,
+      lastComms,
+      lastAccuracyPoints,
+      accuracyPoints,
+      epochProgress,
+      globalMetrics,
+      nodeStats,
+      lastNetworkStats,
+      sessions,
+      completedSessions,
+      displayedAccuracyPoints,
+    };
+  }, [sessionStats, currentSessionStart, lastComms, lastAccuracyPoints, accuracyPoints, epochProgress, globalMetrics, nodeStats, lastNetworkStats, sessions, completedSessions, displayedAccuracyPoints]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("peersim.completedSessions", JSON.stringify(completedSessions));
+    } catch {
+    }
+  }, [completedSessions]);
+
+  const archiveSessionSnapshot = useCallback((reason = "auto") => {
+    const data = currentDataRef.current;
+    if (!data?.currentSessionStart) return;
+
+    const lastSession = data.sessions?.length > 0 ? data.sessions[data.sessions.length - 1] : null;
+    const snapshotId =
+      lastSession?.id ||
+      data.sessionStats?.currentSessionId ||
+      `${reason}-${Date.now()}`;
+
+    setCompletedSessions(prev => {
+      if (prev.some(s => s.id === snapshotId)) return prev;
+      const mergedAccuracy = mergeAccuracySeries(data.lastAccuracyPoints, data.accuracyPoints);
+      const accuracySeries = mergedAccuracy.length > 0 ? mergedAccuracy : (data.displayedAccuracyPoints || []);
+      const snapshot = {
+        id: snapshotId,
+        dataset: lastSession?.dataset || "Session",
+        status: "DONE",
+        createdAt: lastSession?.createdAt || data.currentSessionStart?.toISOString?.() || new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+        samples: lastSession?.samples || 0,
+        nodesUsed: data.lastNetworkStats?.nodes?.length || 0,
+        accuracy: accuracySeries.length > 0 ? accuracySeries[accuracySeries.length - 1] : null,
+        communications: [...(data.lastComms || [])],
+        accuracyPoints: [...accuracySeries],
+        duration: Math.max(1, Math.round((new Date() - data.currentSessionStart) / 1000)),
+        epochs: data.epochProgress,
+        globalMetrics: data.globalMetrics,
+        nodeStats: Object.fromEntries(data.nodeStats || []),
+        networkSize: data.lastNetworkStats?.nodes?.length || 0,
+      };
+      return [snapshot, ...prev];
+    });
+  }, []);
+
+  useEffect(() => {
+    const prev = previousStatusRef.current;
+    const curr = sessionStats.currentStatus;
+    if (prev !== "DONE" && curr === "DONE") {
+      archiveSessionSnapshot("done");
+      setCurrentSessionStart(null);
+    }
+    previousStatusRef.current = curr;
+  }, [sessionStats.currentStatus, archiveSessionSnapshot]);
+
+  /* ---- handlers ---- */
   const handleStart = useCallback(async (payload) => {
     try {
-      const resetTime = Date.now();
-      setClearTick(resetTime);
-      setSelectedSessionId(null);
-      setLastNetworkStats({ activeNodes: 0, nodes: [], ideNode: null, lastUpdated: null });
-      setLastSessionStats({ sessionsCreated: 0, currentSessionId: null, currentStatus: null });
       setLastAccuracyPoints([]);
-      setLastCommunications([]);
-      try {
-        if (payload?.formData && payload?.sessionConfigs) {
-          const first = payload.sessionConfigs[0];
-          if (first && Number.isFinite(first.networkSize)) {
-            setNetworkSize(first.networkSize);
-          }
-        }
-      } catch {}
-      if (!payload?.formData || !payload?.sessionConfigs) {
-        return;
-      }
-
+      /* Note: Do NOT clear lastComms - keep communications from previous session */
+      setCurrentSessionStart(new Date());
+      if (payload?.sessionConfigs?.[0]?.networkSize) setNetworkSize(payload.sessionConfigs[0].networkSize);
+      if (!payload?.formData || !payload?.sessionConfigs) return;
       for (const config of payload.sessionConfigs) {
         const fd = new FormData();
-        for (const [key, value] of payload.formData.entries()) {
-          if (key !== "config") {
-            fd.append(key, value);
-          }
-        }
+        for (const [k, v] of payload.formData.entries()) { if (k !== "config") fd.append(k, v); }
         fd.append("config", JSON.stringify(config));
-
-        const resp = await fetch("http://localhost:8080/api/simulations/start", {
-          method: "POST",
-          body: fd,
-        });
-
-        if (!resp.ok) {
-          const data = await resp.json();
-          alert(data.error || "Failed to start simulation");
-          break;
-        }
+        const resp = await fetch("http://localhost:8080/api/simulations/start", { method: "POST", body: fd });
+        if (!resp.ok) { const d = await resp.json(); alert(d.error || "Failed to start"); break; }
       }
-    } catch (e) {
-      alert(e.message);
-    }
+    } catch (e) { alert(e.message); }
   }, []);
 
   const handleStop = useCallback(async () => {
     try {
-      const resp = await fetch("http://localhost:8080/api/simulations/stop", { method: "POST" });
-      if (!resp.ok) {
-        const data = await resp.json();
-        alert(data.error || "Failed to stop simulation");
-      }
-    } catch (e) {
-      alert(e.message);
-    }
-  }, []);
+      const r = await fetch("http://localhost:8080/api/simulations/stop", { method: "POST" });
+      if (!r.ok) { const d = await r.json(); alert(d.error || "Failed to stop"); }
+      archiveSessionSnapshot("stop");
+      
+      /* Clear current session marker only (keep chart history until explicit clear) */
+      setCurrentSessionStart(null);
+    } catch (e) { alert(e.message); }
+  }, [archiveSessionSnapshot]);
 
   const handleClear = useCallback(() => {
-    const now = Date.now();
-    setClearTick(now);
     setNetworkSize(0);
     setLastNetworkStats({ activeNodes: 0, nodes: [], ideNode: null, lastUpdated: null });
-    setLastSessionStats({ sessionsCreated: 0, currentSessionId: null, currentStatus: null });
     setLastAccuracyPoints([]);
-    setLastCommunications([]);
+    setLastComms([]);
+    setCurrentSessionStart(null);
   }, []);
 
-  const handleRefresh = () => setClearTick(0);
+  const handleClearAllTabs = useCallback(() => {
+    /* Clear ONLY Dashboard, Communications, and Events tabs. Summary tab is PROTECTED */
+    setNetworkSize(0);
+    setLastNetworkStats({ activeNodes: 0, nodes: [], ideNode: null, lastUpdated: null });
+    setLastAccuracyPoints([]);
+    setLastComms([]);
+    setCurrentSessionStart(null);
+    clearEvents();          // ← NEW: Clear Event Log
+    clearCommunications();  // ← NEW: Clear Message Types
+    /* Note: completedSessions stays intact for Summary tab */
+  }, [clearEvents, clearCommunications]);
 
-  // === ARCHITECTURE BUFFER + AFFICHAGE PROGRESSIF ===
-  const eventBufferRef = useRef([]);
-  const [displayedEvents, setDisplayedEvents] = useState([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [bufferLen, setBufferLen] = useState(0);
-  const timeoutRef = useRef(null);
-  const seenEventsRef = useRef(new Set());
-
-  // 1. Buffer : stocke les événements reçus, filtre les logs Chord (finger)
-  useEffect(() => {
-    const newEvents = [];
-    for (const ev of rawEvents) {
-      const id = `${ev.timestamp}-${ev.message}`;
-      if (seenEventsRef.current.has(id)) continue;
-      seenEventsRef.current.add(id);
-
-      // Filtre définitif : supprime les logs de maintenance Chord (finger, successorList, succ/pred, lookup)
-      const msg = ev?.message;
-      if (msg && typeof msg === 'string') {
-        const lower = msg.toLowerCase();
-        // finger table logs
-        if (/finger\[/i.test(lower) || /fingers:/i.test(lower)) {
-          continue;
-        }
-        // successor list logs
-        if (/successorlist:\s*\[.*\]/i.test(lower)) {
-          continue;
-        }
-        // succ/pred logs
-        if (/->\s*succ:\s*n\d+\s*pred:\s*n\d+/i.test(lower)) {
-          continue;
-        }
-        // lookup logs (non‑learning related)
-        if (/lookup for id \d+ -> node n\d+/i.test(lower)) {
-          continue;
-        }
-        // generic Node N... (PeerSim=...) successor or succ/pred patterns
-        if (/node n\d+ \(peersim=\d+\)\s*(successorlist|-> succ)/i.test(lower)) {
-          continue;
-        }
-      }
-
-      newEvents.push(ev);
-    }
-    if (newEvents.length > 0) {
-      eventBufferRef.current = [...eventBufferRef.current, ...newEvents];
-      setBufferLen(eventBufferRef.current.length);
-    }
-  }, [rawEvents]);
-
-  // 2. Consommation progressive avec setInterval
-  const intervalRef = useRef(null);
-
-  useEffect(() => {
-    if (isPaused) {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      return;
-    }
-
-    if (currentIndex >= bufferLen) {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      return;
-    }
-
-    intervalRef.current = setInterval(() => {
-      setCurrentIndex(prev => {
-        const nextIdx = prev + 1;
-        if (nextIdx <= eventBufferRef.current.length) {
-          setDisplayedEvents(eventBufferRef.current.slice(0, nextIdx));
-          return nextIdx;
-        }
-        return prev;
-      });
-    }, globalDelay);
-
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-    };
-  }, [isPaused, globalDelay, bufferLen]);
-
-  // Reset : réinitialise l'affichage
-  const handleReset = useCallback(() => {
-    setDisplayedEvents([]);
-    setCurrentIndex(0);
-    eventBufferRef.current = [];
-    seenEventsRef.current.clear();
-    setBufferLen(0);
-  }, []);
-
-  // Seek : navigation manuelle dans l'historique
-  const handleSeek = useCallback((newIndex) => {
-    const buffer = eventBufferRef.current;
-    const idx = Math.max(0, Math.min(newIndex, buffer.length));
-    setCurrentIndex(idx);
-    setDisplayedEvents(buffer.slice(0, idx));
-  }, []);
-
-  // Filtrage selon clearTick (reset temporel) + suppression définitive des logs Chord (finger)
-  const filteredEvents = useMemo(() => {
-    let events = displayedEvents || [];
-    if (clearTick) {
-      events = events.filter((evt) => {
-        if (!evt?.timestamp) return false;
-        return new Date(evt.timestamp).getTime() > clearTick;
-      });
-    }
-    // Filtre de sécurité : supprime définitivement les logs de maintenance Chord
-    events = events.filter((evt) => {
-      const msg = evt?.message;
-      if (msg && typeof msg === 'string' && (/finger\[/i.test(msg) || /fingers:/i.test(msg))) {
-        return false;
-      }
-      return true;
-    });
-    return events;
-  }, [displayedEvents, clearTick]);
-
-  const accuracyPoints = useMemo(() => parseAccuracy(filteredEvents), [filteredEvents]);
-  const paramEvolution = useMemo(() => parseParamEvolution(filteredEvents), [filteredEvents]);
-  const learningEvents = useMemo(
-    () => (filteredEvents || []).filter((evt) => isLearningLog(evt?.message)),
-    [filteredEvents]
-  );
-  const networkStats = useMemo(() => parseNetworkStats(filteredEvents), [filteredEvents]);
-  const sessionStats = useMemo(() => parseSessionStats(filteredEvents), [filteredEvents]);
-  const sessions = useMemo(() => parseSessions(filteredEvents), [filteredEvents]);
-  const sessionAccuracy = useMemo(() => parseSessionAccuracy(filteredEvents), [filteredEvents]);
-  const communications = useMemo(
-    () => parseCommunications(filteredEvents, networkStats.ideNode || networkStats.nodes[0]),
-    [filteredEvents, networkStats.ideNode, networkStats.nodes]
-  );
-  const sessionNodes = useMemo(() => networkStats.nodes, [networkStats.nodes]);
-  const allNodes = useMemo(() => {
-    if (!networkSize || networkSize < 1) return networkStats.nodes;
-    return Array.from({ length: networkSize }, (_, idx) => `N${idx}`);
-  }, [networkSize, networkStats.nodes]);
-
-  const sessionsSummary = useMemo(() => {
-    return sessions.map((s) => {
-      const accuracy = sessionAccuracy.get(s.id);
-      const start = s.createdAt ? new Date(s.createdAt).getTime() : null;
-      const end = s.lastUpdated ? new Date(s.lastUpdated).getTime() : null;
-      const durationMs = start && end ? Math.max(0, end - start) : null;
-      const duration = durationMs != null
-        ? `${Math.floor(durationMs / 60000)}m ${Math.floor((durationMs % 60000) / 1000)}s`
-        : null;
-      return {
-        id: s.id,
-        status: s.status,
-        dataset: s.dataset || accuracy?.dataset || null,
-        points: accuracy?.points || [],
-        duration,
-        samples: s.samples,
-        nodesUsed: s.nodesUsed,
-        lastUpdatedLabel: s.lastUpdated ? new Date(s.lastUpdated).toLocaleTimeString("en-GB") : null,
-      };
-    });
-  }, [sessions, sessionAccuracy]);
-
-  useEffect(() => {
-    if (sessionsSummary.length === 0) return;
-    setSummaryHistory((prev) => {
-      const merged = new Map();
-      for (const s of prev) merged.set(s.id, s);
-      for (const s of sessionsSummary) merged.set(s.id, s);
-      return Array.from(merged.values());
-    });
-  }, [sessionsSummary]);
-
-  useEffect(() => {
-    if (!filteredEvents || filteredEvents.length === 0) return;
-    setLearningHistory((prev) => {
-      const merged = new Map();
-      for (const item of prev) merged.set(item.id, item);
-
-      for (const evt of filteredEvents) {
-        const message = evt?.message;
-        if (!message || typeof message !== "string") continue;
-        if (evt?.type && evt.type !== "SIM_LOG") continue;
-
-        const createdMatch = message.match(/Session créée\s*:\s*(\S+)/)
-          || message.match(/Session\s+(\S+)\s*:\s*initialisation/)
-          || message.match(/Session\s*:\s*(\S+)/);
-        const sessionId = createdMatch ? createdMatch[1] : null;
-        if (!sessionId) continue;
-
-        const startedAtMs = evt?.timestamp ? new Date(evt.timestamp).getTime() : Date.now();
-        const existing = merged.get(sessionId) || {
-          id: sessionId,
-          sessionId,
-          startedAtMs,
-          startedAtLabel: evt?.timestamp ? new Date(evt.timestamp).toLocaleTimeString("en-GB") : null,
-          dataset: null,
-          summary: null,
-        };
-
-        const datasetMatch = message.match(/Dataset\s*:\s*(.+)$/);
-        if (datasetMatch) existing.dataset = datasetMatch[1].trim();
-
-        const summaryMatch = message.match(/\[EPOCH\s+\d+\]\s+SUMMARY\s*[:\-]?\s*(.*)$/i)
-          || message.match(/SUMMARY\s*[:\-]?\s*(.*)$/i);
-        if (summaryMatch) {
-          const text = summaryMatch[1]?.trim();
-          if (text) existing.summary = text;
-        }
-
-        merged.set(sessionId, existing);
-      }
-
-      return Array.from(merged.values()).sort((a, b) => (b.startedAtMs || 0) - (a.startedAtMs || 0));
-    });
-  }, [filteredEvents]);
-
-  const [lastNetworkStats, setLastNetworkStats] = useDelayedState(networkStats, globalDelay, isPaused);
-  const [lastSessionStats, setLastSessionStats] = useDelayedState(sessionStats, globalDelay, isPaused);
-  const [lastAccuracyPoints, setLastAccuracyPoints] = useDelayedState(accuracyPoints, globalDelay, isPaused);
-  const [lastCommunications, setLastCommunications] = useDelayedState([], globalDelay, isPaused);
-  const [lastLearningEvents, setLastLearningEvents] = useDelayedState([], globalDelay, isPaused);
-  const [lastParamEvolution, setLastParamEvolution] = useDelayedState({ epochs: [], params: [], values: new Map() }, globalDelay, isPaused);
-
-  useEffect(() => {
-    if (networkStats.nodes.length > 0 || networkStats.activeNodes > 0) {
-      setLastNetworkStats(networkStats);
-    }
-  }, [networkStats]);
-
-  useEffect(() => {
-    if (sessionStats.currentSessionId || sessionStats.sessionsCreated > 0) {
-      setLastSessionStats(sessionStats);
-    }
-  }, [sessionStats]);
-
-  useEffect(() => {
-    if (!selectedSessionId && sessions.length > 0) {
-      setSelectedSessionId(sessions[0].id);
-    }
-  }, [sessions, selectedSessionId]);
-
-  useEffect(() => {
-    if (accuracyPoints.length > 0) {
-      setLastAccuracyPoints(accuracyPoints);
-    }
-  }, [accuracyPoints]);
-
-  useEffect(() => {
-    if (communications.length === 0) return;
-    setLastCommunications((prev) => {
-      const merged = new Map();
-      for (const comm of prev) merged.set(comm.id, comm);
-      for (const comm of communications) merged.set(comm.id, comm);
-      const result = Array.from(merged.values());
-      return result.length > 500 ? result.slice(result.length - 500) : result;
-    });
-  }, [communications]);
-
-  useEffect(() => {
-    if (!learningEvents || learningEvents.length === 0) return;
-    setLastLearningEvents(learningEvents);
-  }, [learningEvents]);
-
-  useEffect(() => {
-    if (!paramEvolution || paramEvolution.epochs.length === 0) return;
-    setLastParamEvolution(paramEvolution);
-  }, [paramEvolution]);
+  const effectiveNodes = allNodes.length > 0 ? allNodes : lastNetworkStats.nodes;
+  const ideNode = lastNetworkStats.ideNode;
+  const sessionNodes = lastNetworkStats.nodes;
+  const commTotal = Object.values(commCounts).reduce((a, b) => a + b, 0);
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", backgroundColor: "#F3F4F6" }}>
-      <Sidebar onStart={handleStart} onStop={handleStop} onClear={handleClear} globalDelay={globalDelay} setGlobalDelay={setGlobalDelay} isPaused={isPaused} setIsPaused={setIsPaused} eventFilters={eventFilters} setEventFilters={setEventFilters} />
-      <div style={{ flex: 1, marginLeft: 320, minWidth: 0 }}>
-        <Header connected={connected} onRefresh={handleRefresh} />
-        <main style={{ padding: "24px", maxWidth: 1400, margin: "0 auto", width: "100%" }}>
-          <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
-            <button
-              onClick={() => setActiveTab("dashboard")}
-              style={{
-                backgroundColor: activeTab === "dashboard" ? "#2563EB" : "#E5E7EB",
-                color: activeTab === "dashboard" ? "#fff" : "#374151",
-                border: "none",
-                padding: "8px 16px",
-                borderRadius: 8,
-                cursor: "pointer",
-                fontWeight: 600,
-              }}
-            >
-              Dashboard
-            </button>
-            <button
-              onClick={() => setActiveTab("summary")}
-              style={{
-                backgroundColor: activeTab === "summary" ? "#2563EB" : "#E5E7EB",
-                color: activeTab === "summary" ? "#fff" : "#374151",
-                border: "none",
-                padding: "8px 16px",
-                borderRadius: 8,
-                cursor: "pointer",
-                fontWeight: 600,
-              }}
-            >
-              Summary
-            </button>
-          </div>
+    <div style={{ display: "flex", minHeight: "100vh", background: T.bg, fontFamily: T.fontUI }}>
+      <Sidebar
+        onStart={handleStart}
+        onStop={handleStop}
+        onClear={handleClear}
+        onClearAllTabs={handleClearAllTabs}
+        connected={connected}
+        sessionStatus={sessionStats.currentStatus}
+        currentEpoch={epochProgress.currentEpoch}
+        maxEpoch={epochProgress.maxEpoch}
+        speed={eventSpeed}
+        onSpeedChange={setEventSpeed}
+      />
 
-          {activeTab === "dashboard" && (
+      <div style={{ flex: 1, marginLeft: 300, minWidth: 0, display: "flex", flexDirection: "column" }}>
+        <Header
+          globalMetrics={globalMetrics}
+          connected={connected}
+          onRefresh={() => setLastComms(prev => [...prev])}
+        />
+
+        <main style={{ flex: 1, padding: "24px", maxWidth: 1500, margin: "0 auto", width: "100%" }}>
+          <TabBar active={selectedTab} onChange={setSelectedTab} />
+
+          {/* ── DASHBOARD TAB ── */}
+          {selectedTab === "dashboard" && (
             <>
-              <QuickStats
-                networkStats={{ ...lastNetworkStats, nodes: allNodes }}
-                sessionStats={lastSessionStats}
-                eventCount={(filteredEvents || []).length}
-                connected={connected}
-              />
+              {/* Stat Row */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 20 }}>
+                <MetricCard label="Global Acc" value={globalMetrics.accuracy != null ? (globalMetrics.accuracy * 100).toFixed(2) + "%" : "—"} color={T.green} icon="◎" />
+                <MetricCard label="Global Loss" value={globalMetrics.loss != null ? globalMetrics.loss.toFixed(4) : "—"} color={T.amber} icon="△" />
+                <MetricCard label="Active Nodes" value={lastNetworkStats.activeNodes || effectiveNodes.length} color={T.cyan} icon="⬡" />
+                <MetricCard label="Messages" value={commTotal || communications.length} color={T.purple} icon="↗" />
+                <MetricCard label="Events" value={learningEvents.length} color={T.textSecondary} icon="▣" />
+              </div>
 
-              <LearningStepIndicator events={filteredEvents} />
-
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))",
-                  gap: 20,
-                  marginBottom: 24,
-                }}
-              >
-                <Card style={{ gridColumn: "span 2", minWidth: 380 }}>
+              {/* Main Grid */}
+              <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, marginBottom: 16 }}>
+                {/* Network topology */}
+                <Card title="Network Topology" subtitle={`${effectiveNodes.length} nodes · IDE: ${ideNode || "—"}`}
+                  action={lastNetworkStats.lastUpdated && <span style={{ fontFamily: T.fontMono, fontSize: 10, color: T.textMuted }}>{lastNetworkStats.lastUpdated}</span>}
+                >
                   <NetworkPanel
-                    networkStats={{ ...lastNetworkStats, nodes: allNodes }}
-                    communications={lastCommunications}
+                    nodes={effectiveNodes}
+                    ideNode={ideNode}
                     sessionNodes={sessionNodes}
+                    communications={lastComms}
+                    speed={eventSpeed}
                   />
                 </Card>
-                <Card>
-                  <AccuracyChart events={lastLearningEvents} accuracyPoints={lastAccuracyPoints} />
-                </Card>
-                <Card>
-                  <h3 style={{ margin: "0 0 12px", fontSize: "1rem", fontWeight: 600, color: "#111827" }}>
-                    Model Parameters Evolution
-                  </h3>
-                  <ParamHeatmap data={lastParamEvolution} />
-                </Card>
-                <Card>
-                  <SessionsPanel
-                    sessionStats={lastSessionStats}
-                    sessions={sessions}
-                    selectedSessionId={selectedSessionId}
-                    onSelect={setSelectedSessionId}
+
+                {/* Accuracy chart */}
+                <Card title="Accuracy" subtitle="Local vs Global per epoch">
+                  <AccuracyChart
+                    events={learningEvents}
+                    accuracyPoints={displayedAccuracyPoints}
+                    height={280}
+                    showLegend={true}
                   />
-                </Card>
-                <Card style={{ gridColumn: "span 2", minWidth: 380 }}>
-                  <EventFeed events={filteredEvents} filters={eventFilters} />
                 </Card>
               </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16, marginBottom: 16 }}>
+                {/* Param heatmap */}
+                <Card title="Parameter Heatmap" subtitle="Aggregated depot values per epoch">
+                  <ParamHeatmap data={paramEvolution} />
+                </Card>
+
+                {/* Communication breakdown */}
+                <Card title="Message Types" subtitle={`${commTotal} total`}>
+                  <CommBreakdown counts={commCounts} total={commTotal} />
+                </Card>
+
+                {/* Sessions */}
+                <Card title="Sessions" subtitle={`${sessions.length} session(s)`}>
+                  {sessions.length === 0 && <div style={{ color: T.textMuted, fontFamily: T.fontMono, fontSize: 12, textAlign: "center", padding: 16 }}>No sessions yet.</div>}
+                  {sessions.map(s => (
+                    <div key={s.id} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontFamily: T.fontMono, fontSize: 12, fontWeight: 700, color: T.textPrimary }}>{s.id}</span>
+                        <StatusDot status={s.status} />
+                      </div>
+                      {s.dataset && <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.textMuted, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.dataset.split(/[\\/]/).pop()}</div>}
+                      {s.nodesUsed && <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.cyan, marginTop: 2 }}>{s.nodesUsed} nodes</div>}
+                    </div>
+                  ))}
+                </Card>
+              </div>
+
+              {/* Event Feed */}
+              <Card title="Event Log" subtitle={`Showing last ${Math.min(500, learningEvents.length)} events`}>
+                <EventFeed events={filteredEvents} />
+              </Card>
             </>
           )}
 
-          {activeTab === "summary" && (
-            <SummaryTab sessionsSummary={summaryHistory} learningHistory={learningHistory} />
+          {/* ── NODE GRID TAB ── */}
+          {selectedTab === "nodes" && (
+            <Card title="Node Status" subtitle={`${effectiveNodes.length} nodes in network`}>
+              <NodeStatusGrid nodes={effectiveNodes} nodeStats={nodeStats} ideNode={ideNode} />
+            </Card>
           )}
 
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <button
-              onClick={handleClear}
-              style={{
-                backgroundColor: "#374151",
-                color: "#fff",
-                border: "none",
-                padding: "10px 20px",
-                borderRadius: 8,
-                cursor: "pointer",
-                fontSize: "0.85rem",
-                fontWeight: 500,
-                transition: "background-color 0.2s",
-                height: 40,
-              }}
-              onMouseEnter={(e) => (e.target.style.backgroundColor = "#1F2937")}
-              onMouseLeave={(e) => (e.target.style.backgroundColor = "#374151")}
-            >
-              Clear All Panels
-            </button>
-          </div>
+          {/* ── COMMS TAB ── */}
+          {selectedTab === "comms" && (
+            <CommsTab communications={lastComms} ideNode={ideNode} />
+          )}
 
-          <Footer />
+          {/* ── SUMMARY TAB ── */}
+          {selectedTab === "summary" && (
+            <SummaryTab completedSessions={completedSessions} />
+          )}
         </main>
       </div>
     </div>

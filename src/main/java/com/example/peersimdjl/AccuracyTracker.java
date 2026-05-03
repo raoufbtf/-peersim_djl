@@ -11,6 +11,10 @@ public class AccuracyTracker {
     private static final double MIN_VALID_ACCURACY = 0.0;
     private static final double MAX_VALID_ACCURACY = 1.0;
 
+    private static double round3(double loss) {
+        return Math.floor(loss * 1000.0d) / 1000.0d;
+    }
+
     private static final class Metrics {
         private final double accuracy;
         private final double loss;
@@ -45,6 +49,18 @@ public class AccuracyTracker {
         System.out.printf("[EPOCH %d][Node %s] real accuracy=%.4f%n", epoch, nodeId, clippedAccuracy);
     }
 
+    /**
+     * Enregistre précision et loss réelles d'un nœud pour l'epoch.
+     */
+    public void trackLocalMetrics(String nodeId, float accuracy, float loss, int epoch) {
+        double clippedAccuracy = Math.max(MIN_VALID_ACCURACY, Math.min(MAX_VALID_ACCURACY, accuracy));
+        double clippedLoss = Math.max(0.0, round3(loss));
+        Metrics metrics = new Metrics(clippedAccuracy, clippedLoss);
+        localByEpoch.computeIfAbsent(epoch, ignored -> new LinkedHashMap<>()).put(nodeId, metrics);
+        System.out.printf("[EPOCH %d][Node %s] real accuracy=%.4f real loss=%.3f%n",
+                epoch, nodeId, clippedAccuracy, clippedLoss);
+    }
+
     public void evaluateGlobal(float[] globalParams, int totalDatasetSize, int epoch) {
         Map<String, Metrics> localMetrics = localByEpoch.get(epoch);
         Metrics metrics;
@@ -62,12 +78,17 @@ public class AccuracyTracker {
                 count++;
             }
 
-            metrics = new Metrics(sumAccuracy / count, sumLoss / count);
+            metrics = new Metrics(sumAccuracy / count, round3(sumLoss / count));
         }
 
         globalByEpoch.put(epoch, metrics);
-        System.out.printf("[EPOCH %d][GLOBAL] real accuracy=%.4f real loss=%.6f (dataset=%d)%n",
+        System.out.printf("[EPOCH %d][GLOBAL] real accuracy=%.4f real loss=%.3f (dataset=%d)%n",
                 epoch, metrics.accuracy, metrics.loss, totalDatasetSize);
+    }
+
+    public double getGlobalLoss(int epoch) {
+        Metrics metrics = globalByEpoch.get(epoch);
+        return metrics == null ? Double.NaN : metrics.loss;
     }
 
     public void printEpochSummary(String sessionName, String datasetPath, int epoch) {
@@ -84,13 +105,13 @@ public class AccuracyTracker {
         if (local != null) {
             for (Map.Entry<String, Metrics> entry : local.entrySet()) {
                 Metrics m = entry.getValue();
-                System.out.printf("  Node %-8s | acc=%.4f | loss=%.6f%n", entry.getKey(), m.accuracy, m.loss);
+                System.out.printf("  Node %-8s | acc=%.4f | loss=%.3f%n", entry.getKey(), m.accuracy, m.loss);
             }
         }
 
         Metrics global = globalByEpoch.get(epoch);
         if (global != null) {
-            System.out.printf("  GLOBAL     | acc=%.4f | loss=%.6f%n", global.accuracy, global.loss);
+            System.out.printf("  GLOBAL     | acc=%.4f | loss=%.3f%n", global.accuracy, global.loss);
         }
 
         System.out.println("========================================");

@@ -19,7 +19,18 @@ public class GlobalModelCollector {
 
         for (int paramIndex = 0; paramIndex < numParams; paramIndex++) {
             String key = FederatedDhtKeys.globalKey(epoch, paramIndex);
-            Object value = chord.get(key);
+            ChordProtocol ownerChord = ParameterShardRouter.ownerForParam(chord, paramIndex);
+            if (ownerChord == null) {
+                if (fallbackModel != null && fallbackModel.length > paramIndex) {
+                    global[paramIndex] = fallbackModel[paramIndex];
+                    missingCount++;
+                    continue;
+                }
+                System.out.println("[EPOCH " + epoch + "][Node " + chord.nodeIdString + "] global model incomplet: aucun propriétaire pour " + key);
+                return null;
+            }
+
+            Object value = ownerChord.getLocal(key);
             if (value instanceof Number) {
                 global[paramIndex] = ((Number) value).floatValue();
                 continue;
@@ -31,7 +42,7 @@ public class GlobalModelCollector {
                 continue;
             }
 
-            System.out.println("[EPOCH " + epoch + "][Node " + chord.nodeIdString + "] global model incomplet: key manquante " + key);
+            System.out.println("[EPOCH " + epoch + "][Node " + chord.nodeIdString + "] global model incomplet: key manquante " + key + " sur " + ownerChord.nodeIdString);
             return null;
         }
 

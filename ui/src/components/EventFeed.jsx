@@ -1,153 +1,115 @@
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect } from "react";
 
-const LEVEL_COLORS = {
-  INFO: "#16a34a",
-  WARN: "#ea580c",
-  ERROR: "#dc2626",
+const T = {
+  surface: "#0d1526", card: "#111d35", border: "#1e2d4a",
+  cyan: "#00c8ff", green: "#10d98a", amber: "#f5a623", red: "#f43f5e", purple: "#a78bfa",
+  textPrimary: "#e2eaf8", textSecondary: "#6b82a8", textMuted: "#3d5070",
+  fontMono: "'JetBrains Mono', 'Fira Code', 'Courier New', monospace",
 };
 
-function getEventCategory(event) {
-  const message = event?.message || '';
-  if (/chord|stabilize|notify|successor|predecessor|route|dht|join|leave|lookup|replication|stabilisation|réparation/i.test(message)) {
-    return 'network';
-  }
-  if (/session|IDE élu|election|élection|leader|coordinator|requête/i.test(message)) {
-    return 'session';
-  }
-  if (/batch|dht|stockage|récupération|publication|dépôt/i.test(message)) {
-    return 'dht';
-  }
-  if (/epoch|accuracy|loss|learning|training|gradient|agrégation|fedavg|convergence|vote|entraînement|époque/i.test(message)) {
-    return 'learning';
-  }
-  return 'other';
-}
+const LEVEL_STYLE = {
+  INFO:  { bg: T.cyan + "22",   color: T.cyan,   label: "INFO" },
+  WARN:  { bg: T.amber + "22",  color: T.amber,  label: "WARN" },
+  ERROR: { bg: T.red + "22",    color: T.red,    label: "ERR" },
+  DEBUG: { bg: T.purple + "22", color: T.purple, label: "DBG" },
+};
 
-export default function EventFeed({ events, filters }) {
+const TYPE_COLORS = {
+  GRADIENT:    T.cyan,
+  GOSSIP_VOTE: T.purple,
+  DEPOT:       T.amber,
+  GLOBAL_MODEL: T.green,
+  STATE:       T.red,
+  ACCURACY:    T.green,
+  SIM_LOG:     T.textSecondary,
+};
+
+export default function EventFeed({ events }) {
   const scrollRef = useRef(null);
-  const prevEventsRef = useRef([]);
-  const [newEventIds, setNewEventIds] = useState(new Set());
 
-  // Detect new events for animation
   useEffect(() => {
-    const prevIds = new Set(prevEventsRef.current.map(e => `${e.timestamp}-${e.message}`));
-    const currentEvents = events || [];
-    const currentIds = new Set(currentEvents.map(e => `${e.timestamp}-${e.message}`));
-    const newIds = new Set([...currentIds].filter(id => !prevIds.has(id)));
-    if (newIds.size > 0) {
-      setNewEventIds(newIds);
-      // Clear animation flag after animation ends
-      setTimeout(() => setNewEventIds(new Set()), 600);
-    }
-    prevEventsRef.current = currentEvents;
-  }, [events]);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [events.length]);
 
-  // Auto-scroll to top on new events
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = 0;
-    }
-  }, [(events || []).length]);
-
-  // Apply filters
-  const filtered = (events || []).filter(evt => {
-    if (!filters) return true;
-    const category = getEventCategory(evt);
-    return filters[category] !== false;
-  });
-
-  const displayed = filtered.slice(-500).slice().reverse();
+  const displayed = (events || []).slice(-500).slice().reverse();
 
   return (
-    <div
-      ref={scrollRef}
-      style={{
-        height: "400px",
-        overflowY: "auto",
-        border: "1px solid #d1d5db",
-        borderRadius: "6px",
-        padding: "8px",
-        backgroundColor: "#f9fafb",
-        fontFamily: "monospace",
-        fontSize: "13px",
-      }}
-    >
-      <style>{`
-        @keyframes slideIn {
-          from { opacity: 0; transform: translateY(-10px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        .new-event {
-          animation: slideIn 0.5s ease-out;
-        }
-      `}</style>
+    <div ref={scrollRef} style={{
+      height: 360,
+      overflowY: "auto",
+      background: T.surface,
+      border: `1px solid ${T.border}`,
+      borderRadius: 8,
+      fontFamily: T.fontMono,
+      fontSize: 12,
+    }}>
+      {/* Header line */}
+      <div style={{
+        position: "sticky", top: 0,
+        background: T.card,
+        borderBottom: `1px solid ${T.border}`,
+        padding: "6px 12px",
+        display: "flex", gap: 16,
+        fontSize: 10, color: T.textMuted,
+        textTransform: "uppercase", letterSpacing: "0.06em",
+      }}>
+        <span style={{ minWidth: 70 }}>Time</span>
+        <span style={{ minWidth: 48 }}>Level</span>
+        <span style={{ minWidth: 90 }}>Type</span>
+        <span>Message</span>
+      </div>
+
       {displayed.length === 0 && (
-        <div style={{ color: "#9ca3af", textAlign: "center", padding: "16px" }}>
-          No events yet.
+        <div style={{ color: T.textMuted, textAlign: "center", padding: 24 }}>
+          <div style={{ fontSize: 24, marginBottom: 8 }}>▣</div>
+          Waiting for events…
         </div>
       )}
 
       {displayed.map((evt, idx) => {
-        const eventId = `${evt.timestamp}-${evt.message}`;
-        const isNew = newEventIds.has(eventId);
-        const ts =
-          evt.timestamp != null
-            ? new Date(evt.timestamp).toLocaleTimeString("en-GB", {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-                fractionalSecondDigits: 3,
-              })
-            : "--:--:--.---";
-
-        const levelColor = LEVEL_COLORS[evt.level] || "#6b7280";
+        const ts = evt.timestamp != null
+          ? new Date(evt.timestamp).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+          : "--:--:--";
+        const lvl = LEVEL_STYLE[evt.level] || LEVEL_STYLE.INFO;
+        const typeColor = TYPE_COLORS[evt.type] || T.textSecondary;
 
         return (
-          <div
-            key={eventId}
-            className={isNew ? "new-event" : ""}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "4px 8px",
-              borderBottom: "1px solid #e5e7eb",
-              lineHeight: "1.4",
-            }}
+          <div key={evt.timestamp ? evt.timestamp + "-" + idx : idx} style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+            padding: "5px 12px",
+            borderBottom: `1px solid ${T.border}20`,
+            lineHeight: "1.5",
+          }}
+            onMouseEnter={e => { e.currentTarget.style.background = "#ffffff06"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
           >
-            <span style={{ color: "#6b7280", whiteSpace: "nowrap", minWidth: "100px" }}>{ts}</span>
+            <span style={{ color: T.textMuted, whiteSpace: "nowrap", minWidth: 70, fontSize: 10, paddingTop: 1 }}>{ts}</span>
 
-            <span
-              style={{
-                color: "#fff",
-                backgroundColor: levelColor,
-                borderRadius: "4px",
-                padding: "1px 6px",
-                fontSize: "11px",
-                fontWeight: 600,
-                textTransform: "uppercase",
-                minWidth: "54px",
-                textAlign: "center",
-              }}
-            >
-              {evt.level || "INFO"}
+            <span style={{
+              background: lvl.bg, color: lvl.color,
+              borderRadius: 4, padding: "1px 5px",
+              fontSize: 10, fontWeight: 700,
+              minWidth: 38, textAlign: "center",
+              flexShrink: 0,
+            }}>{lvl.label}</span>
+
+            <span style={{
+              color: typeColor,
+              fontWeight: 600,
+              minWidth: 90,
+              fontSize: 10,
+              paddingTop: 1,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              flexShrink: 0,
+            }} title={evt.type}>{evt.type || "—"}</span>
+
+            <span style={{ color: T.textPrimary, flex: 1, wordBreak: "break-word", fontSize: 11 }}>
+              {evt.message || "—"}
             </span>
-
-            <span
-              style={{
-                color: "#2563eb",
-                fontWeight: 500,
-                minWidth: "90px",
-                whiteSpace: "nowrap",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-              }}
-              title={evt.type}
-            >
-              {evt.type || "—"}
-            </span>
-
-            <span style={{ color: "#1f2937", flex: 1, wordBreak: "break-word" }}>{evt.message || "—"}</span>
           </div>
         );
       })}

@@ -17,6 +17,7 @@ public class SimulationEventPublisher {
     }
 
     private final ArrayDeque<SimulationEvent> buffer = new ArrayDeque<>(5000);
+    private final ArrayDeque<Communication> communicationBuffer = new ArrayDeque<>(5000);
 
     public synchronized void publish(SimulationEvent event) {
         if (buffer.size() >= 5000) {
@@ -29,11 +30,31 @@ public class SimulationEventPublisher {
         }
     }
 
+    /**
+     * Publish a communication event (batch, gradient, depot, global model, vote, etc.)
+     */
+    public synchronized void publishCommunication(Communication communication) {
+        if (communicationBuffer.size() >= 5000) {
+            communicationBuffer.pollFirst();
+        }
+        communicationBuffer.addLast(communication);
+        // Forward over WebSocket
+        if (webSocketBridge != null) {
+            webSocketBridge.sendCommunication(communication);
+        }
+    }
+
     public synchronized List<SimulationEvent> getLast(int limit) {
         List<SimulationEvent> result = new ArrayList<>(limit);
         for (SimulationEvent event : buffer) {
             result.add(event);
         }
+        int fromIndex = Math.max(0, result.size() - limit);
+        return new ArrayList<>(result.subList(fromIndex, result.size()));
+    }
+
+    public synchronized List<Communication> getLastCommunications(int limit) {
+        List<Communication> result = new ArrayList<>(communicationBuffer);
         int fromIndex = Math.max(0, result.size() - limit);
         return new ArrayList<>(result.subList(fromIndex, result.size()));
     }

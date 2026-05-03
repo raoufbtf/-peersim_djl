@@ -39,6 +39,9 @@ public class SimulationRequest {
     @Min(1)
     private int simulationCycles;
 
+    // When true, run the decentralized learning runner instead of the default peersim.Simulator
+    private boolean decentralized;
+
     // Getters and Setters
     public String getModelType() {
         return modelType;
@@ -118,5 +121,13 @@ public class SimulationRequest {
 
     public void setSimulationCycles(int simulationCycles) {
         this.simulationCycles = simulationCycles;
+    }
+
+    public boolean isDecentralized() {
+        return decentralized;
+    }
+
+    public void setDecentralized(boolean decentralized) {
+        this.decentralized = decentralized;
     }
 }

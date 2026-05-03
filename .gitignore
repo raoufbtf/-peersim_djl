@@ -4,3 +4,8 @@ node_modules/
 *.class
 upload/
 graphify-out/
+.claude/
+uploads/
+ui/dist/
+ui/node_modules/
+.vscode/

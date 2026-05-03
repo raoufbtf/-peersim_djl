@@ -27,4 +27,12 @@ public class SimulationEventsController {
         List<SimulationEvent> events = publisher.getLast(limit);
         return ResponseEntity.ok(events);
     }
+
+    @GetMapping("/communications")
+    public ResponseEntity<?> getCommunications(@RequestParam(defaultValue = "200") int limit) {
+        if (limit < 1 || limit > 5000) {
+            return ResponseEntity.status(400).body(java.util.Collections.singletonMap("error", "limit must be 1-5000"));
+        }
+        return ResponseEntity.ok(publisher.getLastCommunications(limit));
+    }
 }

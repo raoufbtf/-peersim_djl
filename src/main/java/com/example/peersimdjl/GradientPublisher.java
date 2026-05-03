@@ -44,15 +44,9 @@ public class GradientPublisher {
             }
             String gradKey = FederatedDhtKeys.gradientKey(epoch, paramIndex);
 
-            Node responsibleNode = chord.lookup(gradKey);
-            if (responsibleNode == null) {
-                System.err.println("[EPOCH " + epoch + "][Node " + nodeId + "] lookup KO for key " + gradKey);
-                continue;
-            }
-
-            ChordProtocol responsibleChord = (ChordProtocol) responsibleNode.getProtocol(ChordProtocol.CHORD_PROTOCOL_ID);
+            ChordProtocol responsibleChord = ParameterShardRouter.ownerForParam(chord, paramIndex);
             if (responsibleChord == null) {
-                System.err.println("[EPOCH " + epoch + "][Node " + nodeId + "] responsibleChord KO for key " + gradKey);
+                System.err.println("[EPOCH " + epoch + "][Node " + nodeId + "] no shard owner for key " + gradKey);
                 continue;
             }
 
@@ -69,8 +63,32 @@ public class GradientPublisher {
             responsibleChord.putLocal(gradKey, depot);
             sentCount++;
 
+                SimulationCommEventLogger.emit(
+                    "GRADIENT",
+                    nodeId,
+                    responsibleChord.nodeIdString,
+                    epoch,
+                    (int) peersim.core.CommonState.getTime(),
+                    "param[" + paramIndex + "]",
+                    (double) delta,
+                    null,
+                    null,
+                    "sparse publish " + sentCount + "/" + count + " params");
+
+                SimulationCommEventLogger.emit(
+                    "GRADIENT",
+                    nodeId,
+                    responsibleChord.nodeIdString,
+                    epoch,
+                    (int) peersim.core.CommonState.getTime(),
+                    "param[" + paramIndex + "]",
+                    (double) delta,
+                    null,
+                    null,
+                    "sparse publish " + sentCount + "/" + count + " params");
+
             if (ChordProtocol.DEBUGChord) {
-                int hops = estimateHopCount(chord, responsibleNode);
+                int hops = estimateHopCount(chord, responsibleChord.selfNode);
                 System.out.println("[EPOCH " + epoch + "][Node " + nodeId + "] grad param[" + paramIndex + "]=" + delta
                         + " -> key=" + gradKey
                         + " target=" + responsibleChord.nodeIdString
@@ -128,11 +146,7 @@ public class GradientPublisher {
 
     private void publishSingleDelta(int epoch, String nodeId, int datasetSize, int paramIndex, float delta) {
         String gradKey = FederatedDhtKeys.gradientKey(epoch, paramIndex);
-        Node responsibleNode = chord.lookup(gradKey);
-        if (responsibleNode == null) {
-            return;
-        }
-        ChordProtocol responsibleChord = (ChordProtocol) responsibleNode.getProtocol(ChordProtocol.CHORD_PROTOCOL_ID);
+        ChordProtocol responsibleChord = ParameterShardRouter.ownerForParam(chord, paramIndex);
         if (responsibleChord == null) {
             return;
         }
@@ -145,6 +159,29 @@ public class GradientPublisher {
         ParamEntry entry = new ParamEntry(nodeId, paramIndex, epoch, delta, datasetSize, System.currentTimeMillis());
         depot.addContribution(entry);
         responsibleChord.putLocal(gradKey, depot);
+        SimulationCommEventLogger.emit(
+            "GRADIENT",
+            nodeId,
+            responsibleChord.nodeIdString,
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "param[" + paramIndex + "]",
+            (double) delta,
+            null,
+            null,
+            "fallback sparse publish 1/1 params");
+
+        SimulationCommEventLogger.emit(
+            "GRADIENT",
+            nodeId,
+            responsibleChord.nodeIdString,
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "param[" + paramIndex + "]",
+            (double) delta,
+            null,
+            null,
+            "sparse publish fallback");
     }
 
     private int estimateHopCount(ChordProtocol sourceChord, Node target) {

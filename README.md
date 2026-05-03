@@ -94,5 +94,22 @@ Composants ajoutés :
 - `AccuracyTracker`
 - `DjlParameterCodec` (NDArray ↔ `float[]`)
 
+## Décentralisé PeerSim
+
+Le scénario décentralisé ajoute les protocoles suivants :
+
+- `LearningProtocol` : apprentissage local et génération de gradients
+- `ParameterDHTProtocol` : routage Chord et agrégation par shard de paramètre
+- `GossipProtocol` : échange de métriques de convergence et diffusion de l'arrêt
+- `ConvergenceProtocol` : décision globale avec ratio de nœuds convergés, delta moyen et stabilité sur `K` cycles
+
+Pour lancer la simulation dédiée, utilisez :
+
+```powershell
+mvn exec:java "-Dexec.mainClass=com.example.peersimdjl.DecentralizedLearningApp"
+```
+
+Le fichier d'exemple est `src/main/resources/decentralized-learning.cfg`.
+
 Bonne exploration ! Ajustez les sources et la configuration pour vos usages.
 
