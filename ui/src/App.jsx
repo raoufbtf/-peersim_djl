@@ -475,8 +475,8 @@ function Sidebar({ onStart, onStop, onClear, onClearAllTabs, connected, sessionS
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <input
             type="range"
-            min={0.25}
-            max={3}
+            min={0.10}
+            max={1}
             step={0.05}
             value={speed}
             onChange={e => onSpeedChange(Number(e.target.value))}
