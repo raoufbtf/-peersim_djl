@@ -196,50 +196,10 @@ import { useState } from "react";
                   <option value="MLP">MLP</option>
                   <option value="CNN">CNN</option>
                 </select>
-                {sessions.length > 1 && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSessions((prev) => prev.filter((s) => s.id !== session.id))
-                    }
-                    style={{
-                      backgroundColor: "#ef4444",
-                      color: "#fff",
-                      border: "none",
-                      padding: "8px 10px",
-                      borderRadius: "8px",
-                      cursor: "pointer",
-                    }}
-                  >
-                    Remove
-                  </button>
-                )}
               </div>
             ))}
           </div>
-          <button
-            type="button"
-            onClick={() =>
-              setSessions((prev) => [
-                ...prev,
-                { id: Date.now(), modelType: "MLP" },
-              ])
-            }
-            style={{
-              marginTop: "8px",
-              backgroundColor: "#2563eb",
-              color: "#fff",
-              border: "none",
-              padding: "8px 12px",
-              borderRadius: "8px",
-              cursor: "pointer",
-              fontWeight: 600,
-            }}
-          >
-            + Add Session
-          </button>
         </div>
-
         <label style={{ display: "block", marginBottom: "12px", color: "#111827", fontWeight: 600 }}>
           Federated epochs
           <input
@@ -280,36 +240,7 @@ import { useState } from "react";
           >
             Start
           </button>
-          <button
-            onClick={handleStop}
-            style={{
-              flex: 1,
-              backgroundColor: "#dc2626",
-              color: "#fff",
-              border: "none",
-              padding: "10px",
-              borderRadius: "8px",
-              cursor: "pointer",
-              fontWeight: 600,
-            }}
-          >
-            Stop
-          </button>
-          <button
-            onClick={handleClear}
-            style={{
-              flex: 1,
-              backgroundColor: "#6b7280",
-              color: "#fff",
-              border: "none",
-              padding: "10px",
-              borderRadius: "8px",
-              cursor: "pointer",
-              fontWeight: 600,
-            }}
-          >
-            Clear
-          </button>
+    
         </div>
       </div>
     );
