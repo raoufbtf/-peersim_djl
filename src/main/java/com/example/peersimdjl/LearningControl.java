@@ -131,6 +131,7 @@ public class LearningControl implements Control {
     private static final int DEFAULT_MAX_TRAINING_MILLIS = 600_000;
     private final int patienceEpochs;
     private final int maxTrainingMillis;
+    private final boolean gossipVote;  // Mode contrôle : true=convergence vote, false=all epochs
 
     private static double round3(double loss) {
         return Math.floor(loss * 1000.0d) / 1000.0d;
@@ -164,6 +165,7 @@ public class LearningControl implements Control {
         this.sessionNodeRequirements = parseNodeRequirements(Configuration.getString(prefix + ".sessionRequirements", ""));
         this.patienceEpochs = Math.max(1, Configuration.getInt(prefix + ".patienceEpochs", DEFAULT_PATIENCE_EPOCHS));
         this.maxTrainingMillis = Math.max(30_000, Configuration.getInt(prefix + ".maxTrainingMillis", DEFAULT_MAX_TRAINING_MILLIS));
+        this.gossipVote = Configuration.getBoolean(prefix + ".gossipVote", true);
         String strategyName = Configuration.getString(prefix + ".batchStrategy", "ROUND_ROBIN");
         BatchAssignmentStrategy parsedStrategy;
         try {
@@ -833,11 +835,36 @@ public class LearningControl implements Control {
         }
 
         int totalDatasetSize = sumDatasetSize(run);
-        run.accuracyTracker.evaluateGlobal(globalModel, totalDatasetSize, epoch);
+        float globalAccuracy = evaluateGlobalAccuracy(run, globalModel);
+        run.accuracyTracker.evaluateGlobal(globalModel, totalDatasetSize, epoch, globalAccuracy);
+        SimulationCommEventLogger.emit(
+            "GLOBAL_ACCURACY",
+            run.currentSession != null ? run.currentSession.ideNodeIdString : "N0",
+            "ALL",
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "global_accuracy",
+            Double.valueOf(globalAccuracy),
+            null,
+            null,
+            "global model evaluated on global dataset");
 
         double globalLoss = run.accuracyTracker.getGlobalLoss(epoch);
         double roundedCurrentLoss = round3(globalLoss);
         double roundedPreviousLoss = round3(run.previousGlobalLoss);
+
+        // DETAILED LOSS & DELTA TRACKING
+        double lossDelta = Math.abs(globalLoss - run.previousGlobalLoss);
+        System.out.printf("[EPOCH %d] ==== Global Model Update ====%n", epoch);
+        System.out.printf("  Loss progression: %.4f → %.4f (change: %.4f)%n",
+            run.previousGlobalLoss, globalLoss, lossDelta);
+        System.out.printf("  Best loss so far: %.4f (at epoch %d)%n",
+            run.bestGlobalLoss, run.bestGlobalEpoch);
+        if (previousGlobalModel != null) {
+            double modelDelta = computeMaxAbsDelta(previousGlobalModel, globalModel);
+            System.out.printf("  Model parameter delta: %.8f (stability threshold: %.8f)%n",
+                modelDelta, PARAMETER_STABILITY_EPSILON);
+        }
 
         if (Double.isFinite(globalLoss) && roundedCurrentLoss < round3(run.bestGlobalLoss)) {
             run.bestGlobalLoss = globalLoss;
@@ -854,13 +881,40 @@ public class LearningControl implements Control {
         double parameterDelta = computeMaxAbsDelta(previousGlobalModel, globalModel);
         boolean stableParameters = !Double.isNaN(parameterDelta)
                 && parameterDelta <= PARAMETER_STABILITY_EPSILON;
-        if (stableParameters) {
+        
+        // DETAILED PARAMETER TRACKING
+        System.out.printf("[EPOCH %d] Parameter Delta: %.6f (stable threshold: %.6f) %s%n",
+            epoch, parameterDelta, PARAMETER_STABILITY_EPSILON,
+            stableParameters ? "✅ STABLE" : "❌ CHANGING");
+        
+        // Track loss change alongside parameter stability
+        double lossChange = Math.abs(globalLoss - run.previousGlobalLoss);
+        System.out.printf("[EPOCH %d] Loss change: %.3f → %.3f (delta=%.3f)%n",
+            epoch, run.previousGlobalLoss, globalLoss, lossChange);
+        
+        if (stableParameters && gossipVote) {  // Only stop on stability in GOSSIP_VOTE mode
             run.stableEpochs++;
-            run.convergenceReached = true;
-            System.out.println("[EPOCH " + epoch + "] parameter stability reached -> stop (maxDelta="
-                + String.format(java.util.Locale.ROOT, "%.6f", parameterDelta)
-                    + ", stableEpochs=" + run.stableEpochs + ")");
+            // Log BEFORE marking convergence, to see if parameters/loss continue changing
+            System.out.printf("[EPOCH %d] ⚠️ Parameters STABLE (round %d/%d) - loss=%.3f, delta=%.6f%n",
+                epoch, run.stableEpochs, 1, globalLoss, parameterDelta);
+            
+            // IMPORTANT: Don't immediately stop; continue for a few more epochs to verify stability
+            // Only mark convergence after N consecutive stable epochs
+            final int STABLE_VERIFICATION_EPOCHS = 2;  // Check 2 more epochs after first stability
+            if (run.stableEpochs >= STABLE_VERIFICATION_EPOCHS) {
+                run.convergenceReached = true;
+                System.out.println("[EPOCH " + epoch + "] parameter stability CONFIRMED -> stop (maxDelta="
+                    + String.format(java.util.Locale.ROOT, "%.6f", parameterDelta)
+                        + ", stableEpochs=" + run.stableEpochs + ")");
+            }
         } else {
+            // If parameters are NOT stable, reset the counter and log why
+            if (run.stableEpochs > 0) {
+                System.out.printf("[EPOCH %d] ❌ Stability BROKEN - parameters changed after %d stable epoch(s)!%n",
+                    epoch, run.stableEpochs);
+                System.out.printf("   Lost stability because: delta=%.6f exceeds threshold=%.6f%n",
+                    parameterDelta, PARAMETER_STABILITY_EPSILON);
+            }
             run.stableEpochs = 0;
         }
 
@@ -880,12 +934,12 @@ public class LearningControl implements Control {
         boolean plateauConverged = !Double.isNaN(globalLoss) && run.noImprovementEpochs >= patienceEpochs;
         boolean thresholdConverged = !Double.isNaN(globalLoss) && roundedCurrentLoss <= LOSS_STOP_THRESHOLD;
 
-        if (plateauConverged) {
+        if (gossipVote && plateauConverged) {  // Only stop on plateau in GOSSIP_VOTE mode
             run.convergenceReached = true;
             System.out.println("[EPOCH " + epoch + "] plateau reached -> stop (noImprovementEpochs="
                     + run.noImprovementEpochs + ", patience=" + patienceEpochs + ", bestLoss="
                     + String.format(java.util.Locale.ROOT, "%.3f", run.bestGlobalLoss) + ")");
-        } else if (thresholdConverged) {
+        } else if (gossipVote && thresholdConverged) {  // Only stop on threshold in GOSSIP_VOTE mode
             run.convergenceReached = true;
             System.out.println("[EPOCH " + epoch + "] loss threshold reached -> stop (current="
                 + String.format(java.util.Locale.ROOT, "%.3f", globalLoss)
@@ -895,7 +949,7 @@ public class LearningControl implements Control {
                 + ")");
         }
 
-        if (isTrainingTimeExceeded(run)) {
+        if (gossipVote && isTrainingTimeExceeded(run)) {  // Only stop on timeout in GOSSIP_VOTE mode
             run.convergenceReached = true;
             System.out.println("[EPOCH " + epoch + "] max training time reached -> stop (elapsedMs="
                     + (System.currentTimeMillis() - run.runStartedAtMs)
@@ -904,8 +958,11 @@ public class LearningControl implements Control {
 
         run.previousGlobalLoss = globalLoss;
 
-        for (ChordProtocol protocol : run.activeParticipants) {
-            gossipConvergence(protocol.nodeIdString, nodeIds, epoch);
+        // Only gossip convergence in GOSSIP_VOTE mode
+        if (gossipVote) {
+            for (ChordProtocol protocol : run.activeParticipants) {
+                gossipConvergence(protocol.nodeIdString, nodeIds, epoch);
+            }
         }
 
         for (String nodeId : nodeIds) {
@@ -916,6 +973,36 @@ public class LearningControl implements Control {
             run.currentSession != null ? run.currentSession.sessionId : null,
             run.request != null ? run.request.csvDataset : null,
             epoch);
+        // Emit per-node evaluation of local models on the global evaluation dataset
+        try {
+            if (run.receivedDataset != null && run.receivedDataset.length > 0) {
+                for (java.util.Map.Entry<String, LocalModelManager> e : run.modelsByNodeId.entrySet()) {
+                    String nodeId = e.getKey();
+                    LocalModelManager mgr = e.getValue();
+                    if (mgr == null) continue;
+                    try {
+                        float accOnGlobal = mgr.evaluateAccuracy(run.receivedDataset);
+                        // Emit structured communication so the UI can aggregate "local-on-global" accuracies
+                        SimulationCommEventLogger.emit(
+                            "LOCAL_ON_GLOBAL",
+                            nodeId,
+                            "ALL",
+                            epoch,
+                            (int) peersim.core.CommonState.getTime(),
+                            "local_on_global",
+                            Double.valueOf(accOnGlobal),
+                            null,
+                            null,
+                            "local model evaluated on global dataset"
+                        );
+                    } catch (Exception inner) {
+                        System.err.println("[LearningControl] ⚠ Failed to evaluate local model on global dataset for " + nodeId + ": " + inner.getMessage());
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            System.err.println("[LearningControl] ⚠ Failed to emit local-on-global metrics: " + ex.getMessage());
+        }
         System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch END =====");
         run.federatedEpoch++;
     }
@@ -938,11 +1025,57 @@ public class LearningControl implements Control {
         return maxDelta;
     }
 
+    private float evaluateGlobalAccuracy(LearningRunState run, float[] globalModel) {
+        if (run == null || run.receivedDataset == null || run.receivedDataset.length == 0) {
+            return Float.NaN;
+        }
+        if (globalModel == null || globalModel.length == 0) {
+            return Float.NaN;
+        }
+
+        int inputSize = inferInputSizeForEvaluation(run);
+        LocalModelManager evaluationModel = new LocalModelManager(
+                "global-eval",
+                inputSize,
+                1,
+                new int[]{128, 64},
+                run.learningRate,
+                configuredModelType);
+
+        try {
+            evaluationModel.setModelWeights(globalModel);
+            return evaluationModel.evaluateAccuracy(run.receivedDataset);
+        } catch (Exception e) {
+            System.err.println("[LearningControl] ⚠ Global accuracy evaluation failed: " + e.getMessage());
+            return Float.NaN;
+        } finally {
+            evaluationModel.close();
+        }
+    }
+
+    private int inferInputSizeForEvaluation(LearningRunState run) {
+        if (run != null && run.receivedDataset != null && run.receivedDataset.length > 0 && run.receivedDataset[0] != null) {
+            return Math.max(1, run.receivedDataset[0].length - 1);
+        }
+        return Math.max(1, configuredNumParams);
+    }
+
     private boolean shouldStopTraining(LearningRunState run) {
         if (run == null) {
             return true;
         }
 
+        // En mode NO_VOTE, continuer TOUS les epochs, ne pas arrêter prématurément
+        if (!gossipVote) {
+            // Seul critère d'arrêt : atteindre la limite d'epochs configurée
+            if (run.federatedEpoch >= federatedEpochLimit) {
+                System.out.println("[LearningControl][NO_VOTE] Atteint limite d'epochs (" + federatedEpochLimit + ")");
+                return true;
+            }
+            return false;
+        }
+
+        // Mode GOSSIP_VOTE (par défaut) : utiliser tous les critères
         if (run.federatedEpoch >= federatedEpochLimit) {
             return true;
         }
@@ -1051,6 +1184,17 @@ public class LearningControl implements Control {
         // Évaluer la précision locale
         float accuracy = model.evaluateLocal(localData);
         run.accuracyTracker.trackLocalMetrics(nodeId, accuracy, loss, epoch);
+        SimulationCommEventLogger.emit(
+            "LOCAL_ACCURACY",
+            nodeId,
+            "ALL",
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "local_accuracy",
+            Double.valueOf(accuracy),
+            null,
+            null,
+            "local model evaluated on local dataset");
         
         // Retourner les nouveaux poids du modèle
         return model.getModelWeights();

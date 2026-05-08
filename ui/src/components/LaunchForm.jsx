@@ -9,6 +9,7 @@ import { useState } from "react";
     { id: 1, modelType: "MLP" },
   ]);
   const [federatedEpochs, setFederatedEpochs] = useState(10);
+  const [gossipVote, setGossipVote] = useState(true);
   const [error, setError] = useState("");
 
   const parseList = (value) =>
@@ -48,6 +49,7 @@ import { useState } from "react";
         maxBatchesPerNode: 2,
         preprocessOnUpload: false,
         simulationCycles: 24,
+        gossipVote: gossipVote,
       }));
 
       setError("");
@@ -215,6 +217,21 @@ import { useState } from "react";
               borderRadius: "8px",
             }}
           />
+        </label>
+
+        <label style={{ display: "flex", alignItems: "center", marginBottom: "12px", color: "#111827", fontWeight: 600, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={gossipVote}
+            onChange={(e) => setGossipVote(e.target.checked)}
+            style={{
+              marginRight: "8px",
+              width: "18px",
+              height: "18px",
+              cursor: "pointer",
+            }}
+          />
+          <span>Gossip Vote: {gossipVote ? "Enabled (convergence-based)" : "Disabled (all epochs)"}</span>
         </label>
 
         {error && (

@@ -42,6 +42,10 @@ public class SimulationRequest {
     // When true, run the decentralized learning runner instead of the default peersim.Simulator
     private boolean decentralized;
 
+    // When true, use gossip with convergence vote (existing behavior)
+    // When false, run all epochs and select best at the end
+    private boolean gossipVote = true;
+
     // Getters and Setters
     public String getModelType() {
         return modelType;
@@ -129,5 +133,13 @@ public class SimulationRequest {
 
     public void setDecentralized(boolean decentralized) {
         this.decentralized = decentralized;
+    }
+
+    public boolean isGossipVote() {
+        return gossipVote;
+    }
+
+    public void setGossipVote(boolean gossipVote) {
+        this.gossipVote = gossipVote;
     }
 }

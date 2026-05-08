@@ -86,6 +86,21 @@ public class AccuracyTracker {
                 epoch, metrics.accuracy, metrics.loss, totalDatasetSize);
     }
 
+    public void evaluateGlobal(float[] globalParams, int totalDatasetSize, int epoch, float actualAccuracy) {
+        if (Float.isNaN(actualAccuracy) || Float.isInfinite(actualAccuracy)) {
+            evaluateGlobal(globalParams, totalDatasetSize, epoch);
+            return;
+        }
+
+        double clippedAccuracy = Math.max(MIN_VALID_ACCURACY, Math.min(MAX_VALID_ACCURACY, actualAccuracy));
+        double clippedLoss = Math.max(0.0, round3(1.0 - clippedAccuracy));
+        Metrics metrics = new Metrics(clippedAccuracy, clippedLoss);
+
+        globalByEpoch.put(epoch, metrics);
+        System.out.printf("[EPOCH %d][GLOBAL] real accuracy=%.4f real loss=%.3f (dataset=%d)%n",
+                epoch, metrics.accuracy, metrics.loss, totalDatasetSize);
+    }
+
     public double getGlobalLoss(int epoch) {
         Metrics metrics = globalByEpoch.get(epoch);
         return metrics == null ? Double.NaN : metrics.loss;

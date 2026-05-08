@@ -53,40 +53,115 @@ function useFonts() {
 }
 
 /* ─── PARSERS ───────────────────────────────────────────── */
-function parseAccuracy(events) {
+function parseAccuracy(events, communications) {
   const sums = new Map();
   const globalByEpoch = new Map();
+  const localOnGlobalByEpoch = new Map();
   for (const evt of events || []) {
     /* structured ACCURACY events */
     if (evt?.type === "ACCURACY" && evt.payload) {
-      const { epoch, localAccuracy, globalAccuracy } = evt.payload;
+      let { epoch, localAccuracy, globalAccuracy } = evt.payload;
+      // Normalise les valeurs envoyées en pourcentage (ex: 76.07) ou en fraction (0.7607)
+      const norm = v => (v == null || Number.isNaN(v) ? null : (Number(v) > 1 ? Number(v) / 100 : Number(v)));
+      localAccuracy = norm(localAccuracy);
+      globalAccuracy = norm(globalAccuracy);
       if (epoch != null) {
-        const e = sums.get(epoch) || { localSum: 0, globalSum: 0, count: 0 };
-        e.localSum += localAccuracy || 0;
-        e.globalSum += globalAccuracy || 0;
-        e.count += 1;
+        const e = sums.get(epoch) || { localSum: 0, localCount: 0, globalSum: 0, globalCount: 0 };
+        if (localAccuracy != null) {
+          e.localSum += localAccuracy;
+          e.localCount += 1;
+        }
+        if (globalAccuracy != null) {
+          e.globalSum += globalAccuracy;
+          e.globalCount += 1;
+          globalByEpoch.set(epoch, globalAccuracy);
+        }
         sums.set(epoch, e);
-        globalByEpoch.set(epoch, globalAccuracy);
       }
       continue;
     }
     const msg = evt?.message;
     if (!msg || typeof msg !== "string") continue;
     const globalMatch = msg.match(/\[EPOCH\s+(\d+)\]\[GLOBAL\]\s+real accuracy=([0-9.]+)/);
-    if (globalMatch) globalByEpoch.set(+globalMatch[1], +globalMatch[2]);
+    if (globalMatch) {
+      let val = +globalMatch[2]; if (val > 1) val = val / 100;
+      globalByEpoch.set(+globalMatch[1], val);
+    }
     const localMatch = msg.match(/\[EPOCH\s+(\d+)\]\[Node\s+\S+\]\s+real accuracy=([0-9.]+)/);
     if (localMatch) {
-      const ep = +localMatch[1], la = +localMatch[2];
-      const e = sums.get(ep) || { localSum: 0, globalSum: 0, count: 0 };
-      e.localSum += la; e.count += 1;
+      const ep = +localMatch[1]; let la = +localMatch[2]; if (la > 1) la = la / 100;
+      const e = sums.get(ep) || { localSum: 0, localCount: 0, globalSum: 0, globalCount: 0 };
+      e.localSum += la;
+      e.localCount += 1;
       sums.set(ep, e);
     }
   }
-  return Array.from(sums.entries()).map(([epoch, v]) => ({
-    epoch,
-    localAccuracy: v.count ? v.localSum / v.count : 0,
-    globalAccuracy: globalByEpoch.get(epoch) ?? (v.count ? v.globalSum / v.count : 0),
-  })).sort((a, b) => a.epoch - b.epoch);
+  // Also parse structured communications for local-on-global accuracy emissions
+  for (const comm of communications || []) {
+    // comm object shape from useWebSocket -> { commType, epoch, value, param, ... }
+    try {
+      const type = String(comm?.commType || comm?.type || "").toUpperCase();
+      const param = String(comm?.param || "").toLowerCase();
+      if (type === "LOCAL_ACCURACY" || param === "local_accuracy") {
+        const ep = Number.isFinite(Number(comm.epoch)) ? Number(comm.epoch) : null;
+        let v = comm.value;
+        if (v == null) continue;
+        v = Number(v);
+        if (Number.isNaN(v)) continue;
+        if (v > 1) v = v / 100;
+        if (ep != null) {
+          const e = sums.get(ep) || { localSum: 0, localCount: 0, globalSum: 0, globalCount: 0 };
+          e.localSum += v;
+          e.localCount += 1;
+          sums.set(ep, e);
+        }
+        continue;
+      }
+
+      if (type === "GLOBAL_ACCURACY" || param === "global_accuracy") {
+        const ep = Number.isFinite(Number(comm.epoch)) ? Number(comm.epoch) : null;
+        let v = comm.value;
+        if (v == null) continue;
+        v = Number(v);
+        if (Number.isNaN(v)) continue;
+        if (v > 1) v = v / 100;
+        if (ep != null) {
+          globalByEpoch.set(ep, v);
+        }
+        continue;
+      }
+
+      if (type === "LOCAL_ON_GLOBAL" || param === "local_on_global") {
+        const ep = Number.isFinite(Number(comm.epoch)) ? Number(comm.epoch) : null;
+        let v = comm.value;
+        if (v == null) continue;
+        v = Number(v);
+        if (Number.isNaN(v)) continue;
+        if (v > 1) v = v / 100; // normalize percent to fraction
+        if (ep != null) {
+          const s = localOnGlobalByEpoch.get(ep) || { sum: 0, count: 0 };
+          s.sum += v; s.count += 1;
+          localOnGlobalByEpoch.set(ep, s);
+        }
+      }
+    } catch (e) {
+      // ignore malformed comms
+    }
+  }
+
+  const epochs = new Set([...sums.keys(), ...globalByEpoch.keys(), ...localOnGlobalByEpoch.keys()]);
+  return Array.from(epochs).map((epoch) => {
+    const v = sums.get(epoch) || { localSum: 0, localCount: 0, globalSum: 0, globalCount: 0 };
+    const lg = localOnGlobalByEpoch.get(epoch) || { sum: 0, count: 0 };
+    return {
+      epoch,
+      localAccuracy: v.localCount ? v.localSum / v.localCount : null,
+      globalAccuracy: globalByEpoch.has(epoch)
+        ? globalByEpoch.get(epoch)
+        : (v.globalCount ? v.globalSum / v.globalCount : null),
+      localOnGlobal: lg.count ? (lg.sum / lg.count) : null,
+    };
+  }).sort((a, b) => a.epoch - b.epoch);
 }
 
 function mergeAccuracySeries(previousPoints, nextPoints) {
@@ -110,7 +185,9 @@ function parseNodeStats(events) {
     if (!msg || typeof msg !== "string") continue;
     const m = msg.match(/\[EPOCH\s+(\d+)\]\[Node\s+(\S+)\]\s+real accuracy=([0-9.]+)\s+real loss=([0-9.]+)/);
     if (m) {
-      const epoch = +m[1], node = m[2], acc = +m[3], loss = +m[4];
+      const epoch = +m[1], node = m[2];
+      let acc = +m[3]; if (acc > 1) acc = acc / 100;
+      const loss = +m[4];
       const prev = latest.get(node);
       if (!prev || epoch >= prev.epoch) latest.set(node, { epoch, accuracy: acc, loss });
     }
@@ -125,7 +202,9 @@ function parseGlobalMetrics(events) {
     if (!msg || typeof msg !== "string") continue;
     const m = msg.match(/\[EPOCH\s+(\d+)\]\[GLOBAL\]\s+real accuracy=([0-9.]+)\s+real loss=([0-9.]+)\s+\(dataset=(\d+)\)/);
     if (m && +m[1] >= epoch) {
-      epoch = +m[1]; accuracy = +m[2]; loss = +m[3]; dataset = +m[4];
+      epoch = +m[1];
+      let acc = +m[2]; if (acc > 1) acc = acc / 100;
+      accuracy = acc; loss = +m[3]; dataset = +m[4];
     }
   }
   return { epoch, accuracy, loss, dataset };
@@ -677,7 +756,7 @@ function SummaryTab({ completedSessions }) {
                 <span style={{ color: T.cyan }}>⬡ {s.networkSize}</span>
                 <span style={{ color: T.purple }}>↗ {s.communications?.length || 0}</span>
               </div>
-              {s.accuracy && <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.green }}>ACC {(s.accuracy.globalAccuracy * 100).toFixed(2)}%</div>}
+              {s.accuracy && <div style={{ fontFamily: T.fontMono, fontSize: 10, color: T.green }}>ACC {(s.accuracy.globalAccuracy * 100).toFixed(4)}%</div>}
             </div>
           ))}
         </div>
@@ -691,7 +770,7 @@ function SummaryTab({ completedSessions }) {
               <MetricCard label="Duration" value={selectedSession.duration} unit="s" color={T.cyan} />
               <MetricCard label="Nodes Used" value={selectedSession.networkSize} color={T.purple} />
               <MetricCard label="Messages" value={selectedSession.communications?.length || 0} color={T.amber} />
-              <MetricCard label="Final Accuracy" value={selectedSession.accuracy ? (selectedSession.accuracy.globalAccuracy * 100).toFixed(2) + "%" : "—"} color={T.green} />
+              <MetricCard label="Final Accuracy" value={selectedSession.accuracy ? (selectedSession.accuracy.globalAccuracy * 100).toFixed(4) + "%" : "—"} color={T.green} />
             </div>
             
             {/* Accuracy Chart */}
@@ -791,6 +870,7 @@ export default function App() {
   const [lastNetworkStats, setLastNetworkStats] = useState({ activeNodes: 0, nodes: [], ideNode: null, lastUpdated: null });
   const [lastAccuracyPoints, setLastAccuracyPoints] = useState([]);
   const [lastComms, setLastComms]           = useState([]);
+  const [accuracyViewMode, setAccuracyViewMode] = useState("combined");
   const [eventSpeed, setEventSpeed]         = useState(1);
   const [completedSessions, setCompletedSessions] = useState(() => {
     try {
@@ -810,7 +890,7 @@ export default function App() {
   /* ---- derived state ---- */
   const filteredEvents = useMemo(() => events || [], [events]);
 
-  const accuracyPoints  = useMemo(() => parseAccuracy(filteredEvents),       [filteredEvents]);
+  const accuracyPoints  = useMemo(() => parseAccuracy(filteredEvents, wsCommunications),       [filteredEvents, wsCommunications]);
   const nodeStats       = useMemo(() => parseNodeStats(filteredEvents),       [filteredEvents]);
   const globalMetrics   = useMemo(() => parseGlobalMetrics(filteredEvents),   [filteredEvents]);
   const epochProgress   = useMemo(() => parseEpochProgress(filteredEvents),   [filteredEvents]);
@@ -1048,9 +1128,18 @@ export default function App() {
 
                 {/* Accuracy chart */}
                 <Card title="Accuracy" subtitle="Local vs Global per epoch">
+                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 8 }}>
+                    <label style={{ fontFamily: T.fontMono, color: T.textMuted, fontSize: 12, alignSelf: "center" }}>View:</label>
+                    <select value={accuracyViewMode} onChange={e => setAccuracyViewMode(e.target.value)} style={{ fontFamily: T.fontMono, fontSize: 12 }}>
+                      <option value="combined">Local (train) + Global</option>
+                      <option value="global-only">Global only</option>
+                      <option value="local-on-global">Local (evaluated on global dataset)</option>
+                    </select>
+                  </div>
                   <AccuracyChart
                     events={learningEvents}
                     accuracyPoints={displayedAccuracyPoints}
+                    viewMode={accuracyViewMode}
                     height={280}
                     showLegend={true}
                   />

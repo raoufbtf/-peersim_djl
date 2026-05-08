@@ -14,6 +14,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Tracks local and remote convergence metrics, then decides when the global
  * training can stop.
  *
+ * Supports two modes:
+ *  1. gossipVote = true (default): Uses gossip-based convergence voting
+ *  2. gossipVote = false: Runs all epochs and selects the best one at the end
+ *
  * FIXES APPLIED:
  *  1. Loss comparée à 3 décimales (truncate3) pour détecter la convergence réelle
  *  2. DEFAULT_EPSILON = 1.0 (accepte tout delta)
@@ -25,6 +29,7 @@ public class ConvergenceProtocol implements CDProtocol {
     private static final double DEFAULT_RATIO_THRESHOLD  = 0.80d;
     private static final double DEFAULT_EPSILON          = 1.0d;   // FIX: était 1.0e-3
     private static final int    DEFAULT_STABLE_ROUNDS    = 1;      // FIX: était 3
+    private static final boolean DEFAULT_GOSSIP_VOTE     = true;   // Mode gossip par défaut
 
     private final Map<Integer, GossipConvergenceMsg> latestMetricsByNode = new ConcurrentHashMap<>();
     private final Set<String> seenStopMessages = ConcurrentHashMap.newKeySet();
@@ -35,6 +40,7 @@ public class ConvergenceProtocol implements CDProtocol {
     private double epsilon;
     private double convergedRatioThreshold;
     private int    stableRoundsRequired;
+    private boolean gossipVote;  // Mode contrôle : true=convergence vote, false=all epochs
 
     private volatile int     localEpoch     = -1;
     private volatile double  localDelta     = Double.POSITIVE_INFINITY;
@@ -64,6 +70,7 @@ public class ConvergenceProtocol implements CDProtocol {
                         Configuration.getDouble(prefix + ".requiredConvergedRatio", DEFAULT_RATIO_THRESHOLD)));
         this.stableRoundsRequired = Math.max(1,
                 Configuration.getInt(prefix + ".requiredStableRounds", DEFAULT_STABLE_ROUNDS));
+        this.gossipVote = Configuration.getBoolean(prefix + ".gossipVote", DEFAULT_GOSSIP_VOTE);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -203,6 +210,20 @@ public class ConvergenceProtocol implements CDProtocol {
     private void evaluateGlobalConvergence() {
         if (localEpoch < 0) return;
 
+        // Mode 1: Gossip Vote - Use convergence voting
+        if (gossipVote) {
+            evaluateGossipVoteMode();
+        }
+        // Mode 2: No Vote - Continue all epochs until explicit stop
+        else {
+            evaluateNoVoteMode();
+        }
+    }
+
+    /**
+     * Mode 1: Gossip Vote - Traditional convergence voting mode
+     */
+    private void evaluateGossipVoteMode() {
         int totalNodes = Math.max(1, ParameterShardRouter.getActiveProtocols().size());
 
         long convergedCount = latestMetricsByNode.values().stream()
@@ -229,13 +250,13 @@ public class ConvergenceProtocol implements CDProtocol {
         boolean meetsCriteria = ratio >= convergedRatioThreshold && lossStable;
 
         System.out.printf(
-            "[CONVERGENCE][epoch=%d] loss=%.3f prev=%.3f lossStable=%s ratio=%.2f%n",
+            "[CONVERGENCE][GOSSIP_VOTE][epoch=%d] loss=%.3f prev=%.3f lossStable=%s ratio=%.2f%n",
             localEpoch, averageDelta, previousTruncatedLoss, lossStable, ratio);
 
         if (meetsCriteria) {
             int stable = stableRounds.incrementAndGet();
             System.out.printf(
-                "[CONVERGENCE][epoch=%d] ✅ stable round %d/%d (loss=%.3f ratio=%.2f)%n",
+                "[CONVERGENCE][GOSSIP_VOTE][epoch=%d] ✅ stable round %d/%d (loss=%.3f ratio=%.2f)%n",
                 localEpoch, stable, stableRoundsRequired, averageDelta, ratio);
 
             if (stable >= stableRoundsRequired) {
@@ -246,7 +267,7 @@ public class ConvergenceProtocol implements CDProtocol {
         } else {
             if (stableRounds.get() != 0) {
                 System.out.printf(
-                    "[CONVERGENCE][epoch=%d] ❌ reset stable rounds (loss=%.3f prev=%.3f ratio=%.2f)%n",
+                    "[CONVERGENCE][GOSSIP_VOTE][epoch=%d] ❌ reset stable rounds (loss=%.3f prev=%.3f ratio=%.2f)%n",
                     localEpoch, averageDelta, previousTruncatedLoss, ratio);
             }
             stableRounds.set(0);
@@ -254,5 +275,28 @@ public class ConvergenceProtocol implements CDProtocol {
 
         // FIX: mise à jour de la loss précédente pour la prochaine époque
         previousTruncatedLoss = averageDelta;
+    }
+
+    /**
+     * Mode 2: No Vote - Run all epochs, don't stop on convergence
+     * This allows training to continue for all configured epochs, 
+     * and the best epoch will be selected at the end.
+     */
+    private void evaluateNoVoteMode() {
+        // In no-vote mode, we don't trigger convergence stopping
+        // The simulation will continue running all configured epochs
+        // Simply log the progress without checking convergence criteria
+
+        double averageDelta = latestMetricsByNode.values().stream()
+                .filter(msg -> msg.epoch == localEpoch)
+                .mapToDouble(msg -> msg.delta)
+                .average()
+                .orElse(Double.POSITIVE_INFINITY);
+
+        System.out.printf(
+            "[CONVERGENCE][NO_VOTE][epoch=%d] loss=%.3f (continuing all epochs, best epoch will be selected at end)%n",
+            localEpoch, averageDelta);
+
+        // Note: stopRequested will NOT be set here - training continues until all epochs complete
     }
 }

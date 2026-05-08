@@ -393,6 +393,7 @@ public class SimulationService {
         overrides.put("control.learning.maxBatchesPerNode",    String.valueOf(req.getMaxBatchesPerNode()));
         overrides.put("control.learning.sessionRequirements",  joinRequirements(req.getSessionRequirements()));
         overrides.put("control.learning.modelType",            req.getModelType());
+        overrides.put("control.learning.gossipVote",           String.valueOf(req.isGossipVote()));
         overrides.put("control.learning.pid",                  "0");
 
         builder.append(System.lineSeparator())
