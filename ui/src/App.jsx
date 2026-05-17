@@ -5,6 +5,7 @@ import AccuracyChart from "./components/AccuracyChart";
 import EventFeed from "./components/EventFeed";
 import NetworkTraceGraph from "./components/NetworkTraceGraph";
 import ParamHeatmap from "./components/ParamHeatmap";
+import ComparisonSummary from "./components/ComparisonSummary";
 
 /* ─── THEME ────────────────────────────────────────────── */
 const T = {
@@ -54,6 +55,7 @@ function useFonts() {
 
 /* ─── PARSERS ───────────────────────────────────────────── */
 function parseAccuracy(events, communications) {
+  const epochTimes = parseEpochTimes(events);
   const sums = new Map();
   const globalByEpoch = new Map();
   const localOnGlobalByEpoch = new Map();
@@ -160,6 +162,7 @@ function parseAccuracy(events, communications) {
         ? globalByEpoch.get(epoch)
         : (v.globalCount ? v.globalSum / v.globalCount : null),
       localOnGlobal: lg.count ? (lg.sum / lg.count) : null,
+      epochTimeMs: epochTimes.has(epoch) ? epochTimes.get(epoch) : null,
     };
   }).sort((a, b) => a.epoch - b.epoch);
 }
@@ -221,6 +224,48 @@ function parseEpochProgress(events) {
     if (fedM) maxEpoch = +fedM[1];
   }
   return { currentEpoch, maxEpoch };
+}
+
+function parseEpochTimes(events) {
+  // Return Map(epoch -> epochTimeMs) using START/END markers or next-epoch heuristics
+  const starts = new Map();
+  const ends = new Map();
+  for (const evt of events || []) {
+    const msg = evt?.message;
+    if (!msg || typeof msg !== "string") continue;
+    const ts = evt.timestamp ? new Date(evt.timestamp).getTime() : (evt.ts ? new Date(evt.ts).getTime() : null);
+    const startM = msg.match(/\[EPOCH\s+(\d+)\].*START/i);
+    if (startM && ts != null) {
+      const ep = +startM[1];
+      if (!starts.has(ep)) starts.set(ep, ts);
+      continue;
+    }
+    const endM = msg.match(/\[EPOCH\s+(\d+)\].*(END|DONE|Transition .* → DONE|Federated Epoch END)/i);
+    if (endM && ts != null) {
+      const ep = +endM[1];
+      // prefer earliest end if multiple
+      if (!ends.has(ep) || ts < ends.get(ep)) ends.set(ep, ts);
+    }
+  }
+
+  // If an epoch has a start but no explicit end, use next epoch's start as end
+  const sortedStarts = [...starts.entries()].sort((a,b)=>a[0]-b[0]);
+  for (let i = 0; i < sortedStarts.length; i++) {
+    const ep = sortedStarts[i][0];
+    if (!ends.has(ep)) {
+      const next = sortedStarts[i+1];
+      if (next) ends.set(ep, next[1]);
+    }
+  }
+
+  const epochTimes = new Map();
+  const allEpochs = new Set([...starts.keys(), ...ends.keys()]);
+  for (const ep of allEpochs) {
+    const s = starts.get(ep);
+    const e = ends.get(ep);
+    if (s != null && e != null && e >= s) epochTimes.set(ep, Math.max(0, e - s));
+  }
+  return epochTimes;
 }
 
 function parseSessionStats(events) {
@@ -778,6 +823,8 @@ function SummaryTab({ completedSessions }) {
               <div style={{ marginBottom: 16 }}>
                 <div style={{ fontFamily: T.fontMono, fontSize: 11, color: T.textSecondary, textTransform: "uppercase", marginBottom: 8, letterSpacing: "0.06em" }}>Training Accuracy</div>
                 <AccuracyChart accuracyPoints={selectedSession.accuracyPoints} height={200} showLegend={true} />
+                <div style={{ height: 16 }} />
+                <ComparisonSummary points={selectedSession.accuracyPoints} compact={true} />
               </div>
             )}
           </Card>
@@ -1133,7 +1180,6 @@ export default function App() {
                     <select value={accuracyViewMode} onChange={e => setAccuracyViewMode(e.target.value)} style={{ fontFamily: T.fontMono, fontSize: 12 }}>
                       <option value="combined">Local (train) + Global</option>
                       <option value="global-only">Global only</option>
-                      <option value="local-on-global">Local (evaluated on global dataset)</option>
                     </select>
                   </div>
                   <AccuracyChart

@@ -19,12 +19,10 @@ function CustomTooltip({ active, payload, label }) {
         const raw = p.value;
         const val = (raw == null || Number.isNaN(raw)) ? null : (Number(raw) > 1 ? Number(raw) / 100 : Number(raw));
         const metricLabel = p.dataKey === "localAccuracy"
-          ? "Local train acc"
+          ? "Local accuracy"
           : p.dataKey === "globalAccuracy"
-            ? "Global eval acc"
-            : p.dataKey === "localOnGlobal"
-              ? "Local (on global dataset)"
-              : p.name;
+            ? "Global accuracy"
+            : p.name;
         return (
           <div key={p.dataKey} style={{ color: p.color, display: "flex", justifyContent: "space-between", gap: 16 }}>
             <span>{metricLabel}</span>
@@ -86,19 +84,17 @@ export default function AccuracyChart({ events, accuracyPoints, height = 280, sh
           )}
           {viewMode === "combined" && (
             <>
-              <Line type="linear" dataKey="localAccuracy" name="Local train acc" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
-              <Line type="linear" dataKey="localOnGlobal" name="Local (on global dataset)" stroke={T.amber} strokeWidth={2} dot={{ r: 3, fill: T.amber, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.amber }} connectNulls={false} />
-              <Line type="linear" dataKey="globalAccuracy" name="Global eval acc" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
+              <Line type="linear" dataKey="localAccuracy" name="Local accuracy" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
+              <Line type="linear" dataKey="globalAccuracy" name="Global accuracy" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
             </>
           )}
-          {viewMode === "local-on-global" && (
+          {viewMode === "local-only" && (
             <>
-              <Line type="linear" dataKey="localOnGlobal" name="Local (on global dataset)" stroke={T.amber} strokeWidth={2} dot={{ r: 3, fill: T.amber, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.amber }} connectNulls={false} />
-              <Line type="linear" dataKey="globalAccuracy" name="Global eval acc" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
+              <Line type="linear" dataKey="localAccuracy" name="Local accuracy" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
             </>
           )}
           {viewMode === "global-only" && (
-            <Line type="linear" dataKey="globalAccuracy" name="Global eval acc" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
+            <Line type="linear" dataKey="globalAccuracy" name="Global accuracy" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
           )}
         </LineChart>
       </ResponsiveContainer>
