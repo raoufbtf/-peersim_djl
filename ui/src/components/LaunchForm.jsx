@@ -25,8 +25,8 @@ import { useState } from "react";
           setError("Only CSV files are allowed: " + f.name);
           return;
         }
-        if (f.size > 50 * 1024 * 1024) {
-          setError("File too large (max 50 MB): " + f.name);
+        if (f.size > 150 * 1024 * 1024) {
+          setError("File too large (max 150 MB): " + f.name);
           return;
         }
       }
@@ -107,7 +107,7 @@ import { useState } from "react";
         </p>
 
         <label style={{ display: "block", marginBottom: "12px", color: "#111827", fontWeight: 600 }}>
-          Dataset files (CSV only, max 50 MB each)
+          Dataset files (CSV only, max 150 MB each)
           <input
             type="file"
             accept=".csv"

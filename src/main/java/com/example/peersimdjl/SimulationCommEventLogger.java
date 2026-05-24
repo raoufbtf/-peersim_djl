@@ -34,6 +34,8 @@ public final class SimulationCommEventLogger {
         try {
             Map<String, Object> payload = new LinkedHashMap<>();
             long seq = SEQ.incrementAndGet();
+            long nowMs = System.currentTimeMillis();
+            String tsStr = LocalTime.now().format(TIME_FORMAT);
             payload.put("seq", seq);
             payload.put("type", type);
             payload.put("from", from);
@@ -45,9 +47,8 @@ public final class SimulationCommEventLogger {
             payload.put("voteCount", voteCount);
             payload.put("threshold", threshold);
             payload.put("detail", detail);
-            String tsStr = LocalTime.now().format(TIME_FORMAT);
             payload.put("timestamp", tsStr);
-            payload.put("ts", System.currentTimeMillis());
+            payload.put("ts", nowMs);
 
             System.out.println(PREFIX + OBJECT_MAPPER.writeValueAsString(payload));
 
@@ -70,7 +71,7 @@ public final class SimulationCommEventLogger {
                             threshold,
                             detail,
                             tsStr,
-                            System.currentTimeMillis()
+                            nowMs
                     );
                     BRIDGE.sendCommunication(comm);
                 } catch (Exception ignored) {

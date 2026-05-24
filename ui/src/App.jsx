@@ -55,7 +55,7 @@ function useFonts() {
 
 /* ─── PARSERS ───────────────────────────────────────────── */
 function parseAccuracy(events, communications) {
-  const epochTimes = parseEpochTimes(events);
+  const epochTimes = parseEpochTimes(events, communications);
   const sums = new Map();
   const globalByEpoch = new Map();
   const localOnGlobalByEpoch = new Map();
@@ -226,14 +226,44 @@ function parseEpochProgress(events) {
   return { currentEpoch, maxEpoch };
 }
 
-function parseEpochTimes(events) {
-  // Return Map(epoch -> epochTimeMs) using START/END markers or next-epoch heuristics
+function parseEpochTimes(events, communications = []) {
+  // Return Map(epoch -> epochTimeMs) using structured timing events first,
+  // then START/END markers or accuracy-based fallbacks.
+  const epochTimes = new Map();
   const starts = new Map();
   const ends = new Map();
-  for (const evt of events || []) {
+  const epochAccuracies = new Map(); // Track ACCURACY events per epoch for fallback timing
+
+  const sources = [
+    ...(communications || []),
+    ...(events || []),
+  ];
+
+  // Preferred path: consume structured timing events emitted by Java.
+  for (const evt of sources) {
+    const epoch = evt?.epoch != null ? Number(evt.epoch) : null;
+    const duration = evt?.value != null ? Number(evt.value) : null;
+    if (evt?.type === "EPOCH_TIMING" && Number.isFinite(epoch) && Number.isFinite(duration) && duration >= 0) {
+      epochTimes.set(epoch, duration);
+      continue;
+    }
+
+    if (evt?.type === "LOCAL_TRAINING" && Number.isFinite(epoch) && Number.isFinite(duration) && duration >= 0) {
+      // Keep local training available for future extensions, but do not use it
+      // as the epoch duration because it is node-specific.
+      continue;
+    }
+
+    // Extract reliable timestamp
+    let ts = null;
+    if (evt?.timestamp) {
+      ts = typeof evt.timestamp === "string" ? new Date(evt.timestamp).getTime() : Number(evt.timestamp);
+    } else if (evt?.ts) {
+      ts = typeof evt.ts === "string" ? new Date(evt.ts).getTime() : Number(evt.ts);
+    }
+    
     const msg = evt?.message;
     if (!msg || typeof msg !== "string") continue;
-    const ts = evt.timestamp ? new Date(evt.timestamp).getTime() : (evt.ts ? new Date(evt.ts).getTime() : null);
     const startM = msg.match(/\[EPOCH\s+(\d+)\].*START/i);
     if (startM && ts != null) {
       const ep = +startM[1];
@@ -245,7 +275,19 @@ function parseEpochTimes(events) {
       const ep = +endM[1];
       // prefer earliest end if multiple
       if (!ends.has(ep) || ts < ends.get(ep)) ends.set(ep, ts);
+      continue;
     }
+    // Fallback: use ACCURACY events as implicit epoch markers
+    if (evt?.type === "ACCURACY" && evt?.payload?.epoch != null && ts != null) {
+      const ep = +evt.payload.epoch;
+      const events = epochAccuracies.get(ep) || [];
+      events.push(ts);
+      epochAccuracies.set(ep, events);
+    }
+  }
+
+  if (epochTimes.size > 0) {
+    return epochTimes;
   }
 
   // If an epoch has a start but no explicit end, use next epoch's start as end
@@ -258,7 +300,16 @@ function parseEpochTimes(events) {
     }
   }
 
-  const epochTimes = new Map();
+  // Fallback: if START/END are missing, use ACCURACY events to estimate timing
+  for (const [ep, timestamps] of epochAccuracies.entries()) {
+    if (!starts.has(ep) && timestamps.length > 0) {
+      starts.set(ep, timestamps[0]);
+    }
+    if (!ends.has(ep) && timestamps.length > 0) {
+      ends.set(ep, timestamps[timestamps.length - 1]);
+    }
+  }
+
   const allEpochs = new Set([...starts.keys(), ...ends.keys()]);
   for (const ep of allEpochs) {
     const s = starts.get(ep);
@@ -917,7 +968,7 @@ export default function App() {
   const [lastNetworkStats, setLastNetworkStats] = useState({ activeNodes: 0, nodes: [], ideNode: null, lastUpdated: null });
   const [lastAccuracyPoints, setLastAccuracyPoints] = useState([]);
   const [lastComms, setLastComms]           = useState([]);
-  const [accuracyViewMode, setAccuracyViewMode] = useState("combined");
+  
   const [eventSpeed, setEventSpeed]         = useState(1);
   const [completedSessions, setCompletedSessions] = useState(() => {
     try {
@@ -1174,18 +1225,11 @@ export default function App() {
                 </Card>
 
                 {/* Accuracy chart */}
-                <Card title="Accuracy" subtitle="Local vs Global per epoch">
-                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginBottom: 8 }}>
-                    <label style={{ fontFamily: T.fontMono, color: T.textMuted, fontSize: 12, alignSelf: "center" }}>View:</label>
-                    <select value={accuracyViewMode} onChange={e => setAccuracyViewMode(e.target.value)} style={{ fontFamily: T.fontMono, fontSize: 12 }}>
-                      <option value="combined">Local (train) + Global</option>
-                      <option value="global-only">Global only</option>
-                    </select>
-                  </div>
+                <Card title="Accuracy" subtitle="per epoch">
                   <AccuracyChart
                     events={learningEvents}
                     accuracyPoints={displayedAccuracyPoints}
-                    viewMode={accuracyViewMode}
+                    viewMode={"local-only"}
                     height={280}
                     showLegend={true}
                   />

@@ -30,6 +30,10 @@ public class LocalModelManager implements Serializable {
     private transient FederatedLocalModel model;
     private transient int trainingIterations = 0;
     private transient float lastValidationAccuracy = Float.NaN;
+    private transient long lastTrainingDurationNs = 0L;
+    private transient long lastAverageEpochDurationNs = 0L;
+    private transient int lastTrainingEpochCount = 0;
+    private transient float lastTrainingLoss = Float.NaN;
     
     public LocalModelManager(String nodeId, int inputSize, int outputSize,
                              int[] hiddenLayers, float learningRate, String modelType) {
@@ -94,16 +98,28 @@ public class LocalModelManager implements Serializable {
         double[][] validationFeatures = extractFeatures(validationRows);
         double[][] validationLabels = extractLabels(validationRows);
         
-        float finalLoss = 0f;
+        long trainingStartNs = System.nanoTime();
+        long totalEpochDurationNs = 0L;
+        float finalLoss = Float.NaN;
         for (int epoch = 0; epoch < numEpochs; epoch++) {
+            long epochStartNs = System.nanoTime();
             float batchLoss = model.trainBatch(trainFeatures, trainLabels);
+            long epochDurationNs = System.nanoTime() - epochStartNs;
+            totalEpochDurationNs += epochDurationNs;
             finalLoss = batchLoss;
             trainingIterations++;
             if (DEBUG && epoch % Math.max(1, numEpochs/3) == 0) {
                 System.out.println(TAG + " [" + nodeId + "] Epoch " + epoch + "/" + numEpochs + 
-                                   " Loss: " + String.format("%.3f", finalLoss));
+                                   " Loss: " + String.format("%.3f", finalLoss)
+                                   + " (" + String.format(java.util.Locale.ROOT, "%.2f", epochDurationNs / 1_000_000.0d)
+                                   + " ms)");
             }
         }
+
+        lastTrainingDurationNs = System.nanoTime() - trainingStartNs;
+        lastAverageEpochDurationNs = numEpochs > 0 ? totalEpochDurationNs / numEpochs : 0L;
+        lastTrainingEpochCount = numEpochs;
+        lastTrainingLoss = finalLoss;
 
         lastValidationAccuracy = model.evaluate(validationFeatures, validationLabels);
         if (DEBUG) {
@@ -113,6 +129,29 @@ public class LocalModelManager implements Serializable {
         }
         
         return finalLoss;
+    }
+
+    public long getLastTrainingDurationMs() {
+        return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(lastTrainingDurationNs);
+    }
+
+    public double getLastAverageEpochDurationMs() {
+        if (lastTrainingEpochCount <= 0) {
+            return Double.NaN;
+        }
+        return lastAverageEpochDurationNs / 1_000_000.0d;
+    }
+
+    public int getLastTrainingEpochCount() {
+        return lastTrainingEpochCount;
+    }
+
+    public float getLastTrainingLoss() {
+        return lastTrainingLoss;
+    }
+
+    public float getLastValidationAccuracy() {
+        return lastValidationAccuracy;
     }
 
     private double[][] extractFeatures(double[][] rows) {
@@ -234,6 +273,10 @@ public class LocalModelManager implements Serializable {
         in.defaultReadObject();
         trainingIterations = 0;
         lastValidationAccuracy = Float.NaN;
+        lastTrainingDurationNs = 0L;
+        lastAverageEpochDurationNs = 0L;
+        lastTrainingEpochCount = 0;
+        lastTrainingLoss = Float.NaN;
         initializeModel();
         if (DEBUG) System.out.println(TAG + " [" + nodeId + "] ✓ Désérialisé et modèle recréé");
     }

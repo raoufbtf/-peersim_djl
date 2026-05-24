@@ -4,7 +4,7 @@ export default function ComparisonSummary({ points = [], compact = false }) {
   const formatted = useMemo(() => {
     const rows = (points || []).map(p => ({
       epoch: p.epoch,
-      localAcc: p.localAccuracy != null ? (p.localAccuracy * 100) : null,
+      localAcc: p.localAccuracy != null ? (p.localAccuracy * 100) : (p.localOnGlobal != null ? (p.localOnGlobal * 100) : null),
       globalAcc: p.globalAccuracy != null ? (p.globalAccuracy * 100) : null,
       epochTimeMs: p.epochTimeMs != null ? Number(p.epochTimeMs) : null,
     }));

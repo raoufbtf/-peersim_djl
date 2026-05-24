@@ -20,9 +20,15 @@ function CustomTooltip({ active, payload, label }) {
         const val = (raw == null || Number.isNaN(raw)) ? null : (Number(raw) > 1 ? Number(raw) / 100 : Number(raw));
         const metricLabel = p.dataKey === "localAccuracy"
           ? "Local accuracy"
-          : p.dataKey === "globalAccuracy"
-            ? "Global accuracy"
-            : p.name;
+          : p.dataKey === "displayLocalAccuracy"
+            ? "Local accuracy"
+            : p.dataKey === "localOnGlobal"
+              ? "Local-on-global accuracy"
+              : p.dataKey === "displayGlobalAccuracy"
+                ? "Global accuracy"
+                : p.dataKey === "globalAccuracy"
+                  ? "Global accuracy"
+                  : p.name;
         return (
           <div key={p.dataKey} style={{ color: p.color, display: "flex", justifyContent: "space-between", gap: 16 }}>
             <span>{metricLabel}</span>
@@ -34,7 +40,7 @@ function CustomTooltip({ active, payload, label }) {
   );
 }
 
-export default function AccuracyChart({ events, accuracyPoints, height = 280, showLegend = true, viewMode = "combined" }) {
+export default function AccuracyChart({ events, accuracyPoints, height = 280, showLegend = true, viewMode = "local-only" }) {
   const fromEvents = (events || [])
     .filter(e => e.type === "ACCURACY" && e.payload)
     .map(e => ({ epoch: e.payload.epoch, localAccuracy: e.payload.localAccuracy, globalAccuracy: e.payload.globalAccuracy }))
@@ -43,6 +49,8 @@ export default function AccuracyChart({ events, accuracyPoints, height = 280, sh
   const data = Array.isArray(accuracyPoints) && accuracyPoints.length > 0 ? accuracyPoints : fromEvents;
   const displayedData = data.map(point => ({
     ...point,
+    displayLocalAccuracy: point.localAccuracy != null ? point.localAccuracy : point.localOnGlobal,
+    displayGlobalAccuracy: point.globalAccuracy,
     displayEpoch: Number.isFinite(Number(point.epoch)) ? Number(point.epoch) + 1 : point.epoch,
   }));
 
@@ -84,17 +92,17 @@ export default function AccuracyChart({ events, accuracyPoints, height = 280, sh
           )}
           {viewMode === "combined" && (
             <>
-              <Line type="linear" dataKey="localAccuracy" name="Local accuracy" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
-              <Line type="linear" dataKey="globalAccuracy" name="Global accuracy" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
+              <Line type="linear" dataKey="displayLocalAccuracy" name="Local accuracy" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
+              <Line type="linear" dataKey="displayGlobalAccuracy" name="Global accuracy" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
             </>
           )}
           {viewMode === "local-only" && (
             <>
-              <Line type="linear" dataKey="localAccuracy" name="Local accuracy" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
+              <Line type="linear" dataKey="displayLocalAccuracy" name="Local accuracy" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.cyan }} connectNulls={false} />
             </>
           )}
           {viewMode === "global-only" && (
-            <Line type="linear" dataKey="globalAccuracy" name="Global accuracy" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
+            <Line type="linear" dataKey="displayGlobalAccuracy" name="Global accuracy" stroke={T.green} strokeWidth={2} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 5, fill: T.green }} connectNulls={false} />
           )}
         </LineChart>
       </ResponsiveContainer>

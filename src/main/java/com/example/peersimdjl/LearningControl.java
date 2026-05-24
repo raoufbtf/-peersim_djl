@@ -58,6 +58,8 @@ public class LearningControl implements Control {
         private int bestGlobalEpoch = -1;
         private float[] bestGlobalModel = null;
         private long runStartedAtMs = System.currentTimeMillis();
+        private long totalEpochDurationNs = 0L;
+        private int completedEpochCount = 0;
         private int noImprovementEpochs = 0;
         private float learningRate = 0.05f;
         private AccuracyTracker accuracyTracker = new AccuracyTracker();
@@ -135,6 +137,10 @@ public class LearningControl implements Control {
 
     private static double round3(double loss) {
         return Math.floor(loss * 1000.0d) / 1000.0d;
+    }
+
+    private static double nanosToMs(long nanos) {
+        return nanos / 1_000_000.0d;
     }
 
     /**
@@ -792,6 +798,7 @@ public class LearningControl implements Control {
         }
 
         int epoch = run.federatedEpoch;
+        long epochStartNs = System.nanoTime();
         java.util.List<String> nodeIds = collectParticipantNodeIds(run);
         int expectedContributors = nodeIds.size();
         int numParams = inferNumParams(run);
@@ -800,6 +807,17 @@ public class LearningControl implements Control {
             : java.util.Arrays.copyOf(run.currentGlobalModel, run.currentGlobalModel.length);
 
         System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch START =====");
+        SimulationCommEventLogger.emit(
+            "EPOCH_TIMING",
+            run.currentSession != null ? run.currentSession.ideNodeIdString : "N0",
+            "ALL",
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "epoch_start",
+            null,
+            null,
+            null,
+            "federated epoch start");
 
         for (ChordProtocol protocol : run.activeParticipants) {
             String nodeId = protocol.nodeIdString;
@@ -831,6 +849,7 @@ public class LearningControl implements Control {
 
         if (globalModel == null) {
             System.out.println("[EPOCH " + epoch + "] Modèle global incomplet, attente prochain cycle.");
+            recordEpochTiming(run, epoch, epochStartNs, false, "global model incomplete");
             return;
         }
 
@@ -1004,7 +1023,46 @@ public class LearningControl implements Control {
             System.err.println("[LearningControl] ⚠ Failed to emit local-on-global metrics: " + ex.getMessage());
         }
         System.out.println("[EPOCH " + epoch + "] ===== Federated Epoch END =====");
+        recordEpochTiming(run, epoch, epochStartNs, true, "federated epoch end");
         run.federatedEpoch++;
+    }
+
+    private void recordEpochTiming(LearningRunState run, int epoch, long epochStartNs, boolean completed, String detail) {
+        long epochDurationNs = Math.max(0L, System.nanoTime() - epochStartNs);
+        double epochDurationMs = nanosToMs(epochDurationNs);
+        double avgEpochMs;
+
+        if (completed) {
+            run.totalEpochDurationNs += epochDurationNs;
+            run.completedEpochCount++;
+            avgEpochMs = run.completedEpochCount > 0
+                    ? nanosToMs(run.totalEpochDurationNs) / run.completedEpochCount
+                    : Double.NaN;
+        } else {
+            avgEpochMs = run.completedEpochCount > 0
+                    ? nanosToMs(run.totalEpochDurationNs) / run.completedEpochCount
+                    : Double.NaN;
+        }
+
+        System.out.printf(java.util.Locale.ROOT,
+                "[EPOCH %d] timing=%s duration=%.2f ms avgEpoch=%.2f ms completed=%d%n",
+                epoch,
+                completed ? "completed" : "pending",
+                epochDurationMs,
+                avgEpochMs,
+                run.completedEpochCount);
+
+        SimulationCommEventLogger.emit(
+                "EPOCH_TIMING",
+                run.currentSession != null ? run.currentSession.ideNodeIdString : "N0",
+                "ALL",
+                epoch,
+            (int) peersim.core.CommonState.getTime(),
+                "epoch_duration_ms",
+                Double.valueOf(epochDurationMs),
+                completed ? String.valueOf(run.completedEpochCount) : null,
+                Double.isNaN(avgEpochMs) ? null : Double.valueOf(avgEpochMs),
+                completed ? detail : detail + " | retry");
     }
 
     private double computeMaxAbsDelta(float[] previousModel, float[] currentModel) {
@@ -1177,9 +1235,31 @@ public class LearningControl implements Control {
         // Entraîner le modèle local sur 1-3 epochs
         int localEpochs = Math.min(3, Math.max(1, datasetSize / 50));
         float loss = model.trainLocalModel(localData, localEpochs);
-        System.out.println("[LearningControl] [" + nodeId + "] Epoch " + epoch + 
-                         " Training Loss: " + String.format("%.3f", loss) + 
-                         " on " + localData.length + " samples");
+        long trainDurationMs = model.getLastTrainingDurationMs();
+        double avgLocalEpochMs = model.getLastAverageEpochDurationMs();
+        int trainedEpochs = model.getLastTrainingEpochCount();
+
+        System.out.printf(java.util.Locale.ROOT,
+            "[LearningControl] [%s] Epoch %d %s training loss=%.3f time=%d ms avgEpoch=%.2f ms epochs=%d samples=%d%n",
+            nodeId,
+            epoch,
+            configuredModelType,
+            loss,
+            trainDurationMs,
+            avgLocalEpochMs,
+            trainedEpochs,
+            localData.length);
+        SimulationCommEventLogger.emit(
+            "LOCAL_TRAINING",
+            nodeId,
+            "ALL",
+            epoch,
+            (int) peersim.core.CommonState.getTime(),
+            "train_ms",
+            Double.valueOf(trainDurationMs),
+            String.valueOf(trainedEpochs),
+            Double.isNaN(avgLocalEpochMs) ? null : Double.valueOf(avgLocalEpochMs),
+            "model=" + configuredModelType + ", loss=" + String.format(java.util.Locale.ROOT, "%.3f", loss));
         
         // Évaluer la précision locale
         float accuracy = model.evaluateLocal(localData);
@@ -1337,6 +1417,14 @@ public class LearningControl implements Control {
 
             System.out.println("[LearningControl] ✓ Nettoyage batchs physiques terminé : " + deletedCount + "/" + run.distributedBatches.size());
             sessionQueueManager.onSessionComplete(run.request.sessionId);
+            double averageEpochMs = run.completedEpochCount > 0
+                    ? nanosToMs(run.totalEpochDurationNs) / run.completedEpochCount
+                    : Double.NaN;
+            System.out.printf(java.util.Locale.ROOT,
+                    "[LearningControl] ⏱ Run timing summary: total=%d ms, completedEpochs=%d, avgEpoch=%.2f ms%n",
+                    System.currentTimeMillis() - run.runStartedAtMs,
+                    run.completedEpochCount,
+                    averageEpochMs);
             System.out.println("[LearningControl] === Apprentissage distribué TERMINÉ ===");
             SimulationCommEventLogger.emit(
                     "STATE",
@@ -1348,7 +1436,7 @@ public class LearningControl implements Control {
                     null,
                     null,
                     null,
-                    "DONE");
+                    "DONE | avgEpochMs=" + (Double.isNaN(averageEpochMs) ? "NaN" : String.format(java.util.Locale.ROOT, "%.2f", averageEpochMs)));
             run.completionDone = true;
         } else {
             System.err.println("[LearningControl] ✗ Erreur lors de la transition DONE");

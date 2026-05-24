@@ -44,9 +44,9 @@ public class FileStorageService {
                 if (original == null || !original.toLowerCase().endsWith(".csv")) {
                     throw new IllegalArgumentException("Only CSV files are allowed: " + original);
                 }
-                // Validate size <= 50 MB
-                if (file.getSize() > 50L * 1024 * 1024) {
-                    throw new IllegalArgumentException("File too large (max 50 MB): " + original);
+                // Validate size <= 150 MB
+                if (file.getSize() > 150L * 1024 * 1024) {
+                    throw new IllegalArgumentException("File too large (max 150 MB): " + original);
                 }
                 // Sanitize name (remove path separators)
                 String sanitized = original.replaceAll("[\\\\/]+", "_");
